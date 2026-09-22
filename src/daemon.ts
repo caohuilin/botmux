@@ -411,6 +411,7 @@ import { renderMessageListenerPrompt, refreshListenerCardTextFromResolved } from
 import { renderCommandTriggerPrompt } from './services/command-trigger.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { sweepOrphanScratchSandboxes } from './adapters/backend/scratch-sandbox.js';
+import { sweepOrphanMacScratchSandboxes } from './adapters/backend/scratch-sandbox-darwin.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { HerdrBackend } from './adapters/backend/herdr-backend.js';
 import { ZellijBackend } from './adapters/backend/zellij-backend.js';
@@ -26903,6 +26904,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   try {
     sweepOrphanSandboxes(config.session.dataDir, new Set([...activeSessions.values()].map(ds => ds.session.sessionId)));
     sweepOrphanScratchSandboxes(config.session.dataDir, new Set([...activeSessions.values()].map(ds => ds.session.sessionId)));
+    sweepOrphanMacScratchSandboxes(config.session.dataDir, new Set([...activeSessions.values()].map(ds => ds.session.sessionId)));
   } catch (err: any) {
     logger.warn(`[sandbox-sweep] failed: ${err?.message ?? err}`);
   }
@@ -26963,6 +26965,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     try {
       sweepOrphanSandboxes(config.session.dataDir, new Set([...activeSessions.values()].map(ds => ds.session.sessionId)));
     sweepOrphanScratchSandboxes(config.session.dataDir, new Set([...activeSessions.values()].map(ds => ds.session.sessionId)));
+    sweepOrphanMacScratchSandboxes(config.session.dataDir, new Set([...activeSessions.values()].map(ds => ds.session.sessionId)));
     } catch (err: any) {
       logger.warn(`[sandbox-reconcile] failed: ${err?.message ?? err}`);
     }
