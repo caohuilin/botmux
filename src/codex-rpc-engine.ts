@@ -30,6 +30,8 @@ import { homedir } from 'node:os';
 import { WebSocket } from 'ws';
 import {
   CODEX_OUTPUT_LIMIT_ERROR_CODE,
+  CODEX_CAPACITY_ERROR_CODE,
+  isCodexCapacityError,
   isExactCodexOutputLimitError,
 } from './services/codex-transcript.js';
 
@@ -37,6 +39,7 @@ type Json = Record<string, any>;
 type LogFn = (msg: string) => void;
 
 function rpcTurnErrorCode(error: unknown, fallback = 'rpc_turn_failed'): string {
+  if (isCodexCapacityError(error)) return CODEX_CAPACITY_ERROR_CODE;
   if (isExactCodexOutputLimitError(error)) return CODEX_OUTPUT_LIMIT_ERROR_CODE;
   if (error && typeof error === 'object') {
     const record = error as Record<string, unknown>;

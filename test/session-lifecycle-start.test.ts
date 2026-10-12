@@ -3376,7 +3376,9 @@ describe('ordinary Claude semantic recovery', () => {
   });
 
   it.each([
-    ['codex', {}],
+    ['gemini', {}],
+    ['codex', { adoptedFrom: { sessionId: 'external' } }],
+    ['codex', { chatId: 'http_async_test' }],
     ['claude-code', { adoptedFrom: { sessionId: 'external' } }],
     ['claude-code', { session: { vcMeetingReceiver: { listenerAppId: 'app', meetingId: 'm', memberId: 'u', memberEpoch: 1 } } }],
     ['claude-code', { chatId: 'http_async_test' }],
@@ -7695,5 +7697,147 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(sentMessages(worker).filter(message => message.turnId !== SCHEDULED_TURN)).toHaveLength(0);
     expect(ds.session.ordinaryTurnRecovery?.status).toBe('attention_required');
+  });
+});
+
+describe('Codex capacity recovery', () => {
+  async function boot() {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_card');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_capacity');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_capacity' });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_capacity' });
+    await vi.advanceTimersByTimeAsync(0);
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null); return true;
+    });
+    worker.send.mockClear(); sessionReply.mockClear();
+    return { ds, worker, sessionReply };
+  }
+  function continuations(worker: any) {
+    return vi.mocked(worker.send).mock.calls.map(call => call[0] as any)
+      .filter(message => message?.type === 'message' && message.turnId?.startsWith('bmx-recovery-'));
+  }
+  function fail(ds: DaemonSession, worker: any, turnId = 'om_capacity', errorCode = 'codex_capacity_exceeded') {
+    worker.emit('message', { type: 'final_output', turnId, lastUuid: turnId, content: 'capacity diagnostic', turnFailed: true, turnFailureCode: errorCode });
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId, status: 'failed', errorCode });
+  }
+
+  it('continues capacity failures twice with backoff and one actionable exhaustion card', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(14_999);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(sessionReply).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(continuations(worker)).toHaveLength(1);
+    const first = continuations(worker)[0];
+    expect(first.content).toContain('checkpoint');
+    expect(first.content).not.toContain('original task');
+    worker.emit('message', { type: 'turn_input_received', turnId: first.turnId });
+    worker.emit('message', { type: 'turn_input_committed', turnId: first.turnId });
+    fail(ds, worker, first.turnId);
+    await vi.advanceTimersByTimeAsync(44_999);
+    expect(continuations(worker)).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    const second = continuations(worker)[1];
+    expect(second.turnId).not.toBe(first.turnId);
+    worker.emit('message', { type: 'turn_input_received', turnId: second.turnId });
+    worker.emit('message', { type: 'turn_input_committed', turnId: second.turnId });
+    fail(ds, worker, second.turnId);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(2);
+    expect(ds.session.ordinaryTurnRecovery).toMatchObject({ status: 'exhausted', continuationsStarted: 2 });
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(sessionReply.mock.calls[0][1]).toContain('turn-failed');
+  });
+
+  it.each(['codex_auth_failed', 'codex_rate_limited', 'codex_upstream_error', 'codex_connection_failed'])(
+    'keeps %s on the normal failure path without automatic continuation', async errorCode => {
+      const { ds, worker, sessionReply } = await boot();
+      fail(ds, worker, 'om_capacity', errorCode);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(continuations(worker)).toHaveLength(0);
+      expect(sessionReply).toHaveBeenCalledOnce();
+    },
+  );
+
+  it('new user input cancels the backoff and cannot revive the failed task', async () => {
+    const { ds, worker } = await boot();
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(sendWorkerInput(ds, 'new task', 'om_new')).toBe(true);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(ds.session.ordinaryTurnRecovery).toMatchObject({ logicalTurnId: 'om_new', status: 'running' });
+  });
+
+  it('a type-ahead successor prevents late predecessor failure from scheduling recovery', async () => {
+    const { ds, worker } = await boot();
+    expect(sendWorkerInput(ds, 'new task', 'om_new')).toBe(true);
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(ds.session.ordinaryTurnRecovery?.logicalTurnId).toBe('om_new');
+  });
+
+  it('Ctrl+C cancels recovery during the backoff', async () => {
+    const { ds, worker } = await boot();
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(1_000);
+    const { sendWorkerSessionInput } = await import('../src/core/worker-pool.js');
+    expect(sendWorkerSessionInput(ds, { type: 'term_action', key: 'ctrlc' })).toBe(true);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('cancelled');
+  });
+
+  it('a timer persistence failure stops recovery without crashing or executing input', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(1_000);
+    vi.mocked(sessionStore.updateSession).mockImplementationOnce(() => { throw new Error('disk full'); });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(ds.session.ordinaryTurnRecovery).toMatchObject({ status: 'attention_required', lastErrorCode: 'recovery_persist_failed' });
+    expect(sessionReply).toHaveBeenCalledOnce();
+  });
+
+  it('suppresses a capacity fallback arriving after the RPC terminal', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_capacity', status: 'failed', errorCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(0);
+    worker.emit('message', { type: 'final_output', turnId: 'om_capacity', lastUuid: 'om_capacity', content: 'late capacity diagnostic', turnFailed: true, turnFailureCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(14_999);
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(continuations(worker)).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(continuations(worker)).toHaveLength(1);
+  });
+
+  it('never continues a capacity failure that belongs to an HTTP waiter', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    const reject = vi.fn();
+    ds.pendingWaitPromises = new Map([['om_capacity', { resolve: vi.fn(), reject }]]);
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(reject).toHaveBeenCalledOnce();
+    expect(continuations(worker)).toHaveLength(0);
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('a completed continuation settles recovery without another retry', async () => {
+    const { ds, worker } = await boot();
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(15_000);
+    const turnId = continuations(worker)[0].turnId;
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId, status: 'completed' });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(1);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('completed');
   });
 });

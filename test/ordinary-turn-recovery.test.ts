@@ -864,3 +864,43 @@ describe('silent scheduled turns keep their silence across continuations', () =>
     expect(ordinaryTurnRecoverySilentTurnIds(state({ status: 'cancelled' }))).toEqual([]);
   });
 });
+
+describe('restricted capacity-recovery policy', () => {
+  function attach(session: any, extras: any = {}) {
+    const runs: Array<() => void> = [];
+    const enqueue = vi.fn(() => true);
+    const warn = vi.fn();
+    attachOrdinaryTurnRecovery(session, {
+      schedule: (_delay, run) => { runs.push(run); return run; }, cancel: vi.fn(),
+      persist: vi.fn(), enqueue, warn, recoverableErrorCodes: ['codex_capacity_exceeded'],
+      supersedeOnUserInput: true, backoffMs: [15_000, 45_000], now: () => 1_000, ...extras,
+    });
+    return { runs, enqueue, warn };
+  }
+  it('restores the persisted backoff once and never enqueues on a duplicate timer callback', () => {
+    const session = { sessionId: 'capacity-restore', ordinaryTurnRecovery: state({ status: 'backoff', nextAttemptAt: 16_000 }) };
+    const { runs, enqueue } = attach(session);
+    runs[0](); runs[0]();
+    expect(enqueue).toHaveBeenCalledOnce();
+    expect(session.ordinaryTurnRecovery).toMatchObject({ status: 'running', continuationsStarted: 1 });
+    disposeOrdinaryTurnRecovery(session);
+  });
+  it('does not replay a handoff with an unknown execution outcome after restart', () => {
+    const session = { sessionId: 'capacity-handoff', ordinaryTurnRecovery: state({ status: 'dispatching', currentTurnId: 'bmx-recovery-unknown', continuationsStarted: 1 }) };
+    const { runs, enqueue, warn } = attach(session);
+    expect(runs).toHaveLength(0);
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledOnce();
+    expect(session.ordinaryTurnRecovery).toMatchObject({ status: 'attention_required', lastErrorCode: 'recovery_dispatch_interrupted' });
+    disposeOrdinaryTurnRecovery(session);
+  });
+  it('honours an explicit retry refusal even for a capacity code', () => {
+    const session = { sessionId: 'capacity-refused', ordinaryTurnRecovery: state() };
+    const { runs, enqueue, warn } = attach(session);
+    handleOrdinaryTurnRecoveryTerminal(session, { turnId: 'om_original', status: 'failed', errorCode: 'codex_capacity_exceeded', retryable: false });
+    expect(runs).toHaveLength(0);
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledOnce();
+    disposeOrdinaryTurnRecovery(session);
+  });
+});

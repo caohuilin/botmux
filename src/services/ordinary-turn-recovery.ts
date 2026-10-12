@@ -132,6 +132,11 @@ export interface OrdinaryTurnRecoveryDeps<TTimer = unknown> {
   now?: () => number;
   randomId?: () => string;
   backoffMs?: readonly number[];
+  /** A narrow CLI may continue only these explicit failure codes. Other
+   * terminals settle bookkeeping silently and keep their normal UI path. */
+  recoverableErrorCodes?: readonly string[];
+  /** Codex newer input supersedes the old recovery even during execution. */
+  supersedeOnUserInput?: boolean;
 }
 
 export interface OrdinaryTurnRecoverySession {
@@ -177,7 +182,8 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
     // terminal has no recovery consumer. Once the current turn has actually
     // entered backoff (or reached a terminal state), a fresh admitted user turn
     // may replace it as before.
-    if (this.state?.status === 'running' || this.state?.status === 'dispatching') {
+    if (!this.deps.supersedeOnUserInput
+      && (this.state?.status === 'running' || this.state?.status === 'dispatching')) {
       // Remember the successor without disturbing the live owner. A persist
       // failure here degrades to the old behaviour (successor not tracked).
       const live = this.state;
@@ -256,8 +262,15 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
         ...(current.silentLogicalTurnIds ? { silentLogicalTurnIds: current.silentLogicalTurnIds } : {}),
       }, rest));
     }
+    if (this.deps.recoverableErrorCodes
+      && (terminal.status !== 'failed'
+        || !this.deps.recoverableErrorCodes.includes(terminal.errorCode ?? ''))) {
+      return this.commit({ ...current, status: 'cancelled', nextAttemptAt: undefined });
+    }
     if (terminal.errorCode === 'provider_rate_limited') return current;
-    if (terminal.status !== 'failed' || terminal.retryable !== true) {
+    if (terminal.status !== 'failed'
+      || terminal.retryable === false
+      || (!this.deps.recoverableErrorCodes && terminal.retryable !== true)) {
       const next = {
         ...current,
         status: 'attention_required' as const,
@@ -438,6 +451,17 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
   dispose(): void {
     this.cancelTimer();
   }
+
+  handlesTerminal(terminal: OrdinaryTurnRecoveryTerminal, current: OrdinaryTurnRecoveryState): boolean {
+    if (!this.deps.recoverableErrorCodes) return true;
+    // RPC can report the terminal before its rollout fallback appears. Keep
+    // owning that same failure during backoff/exhaustion so the late diagnostic
+    // cannot duplicate the coordinator's notice. New input/cancellation fences
+    // the old identity out through the registry below.
+    return current.status !== 'cancelled' && current.status !== 'completed'
+      && terminal.status === 'failed'
+      && this.deps.recoverableErrorCodes.includes(terminal.errorCode ?? '');
+  }
 }
 
 /** Bind the pure coordinator to one persisted Session. This registry is only a
@@ -541,6 +565,7 @@ export function ordinaryTurnRecoveryHandlesTerminal(
 ): boolean {
   const current = session.ordinaryTurnRecovery;
   if (attachedRecoveries.get(session.sessionId)?.session !== session || !current) return false;
+  if (!attachedRecoveries.get(session.sessionId)!.coordinator.handlesTerminal(terminal, current)) return false;
   if (current.currentTurnId === terminal.turnId) return true;
   // A queued type-ahead successor is adopted by onTerminal only while the
   // original owner itself is still running (no continuation dispatched); in any

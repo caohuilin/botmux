@@ -373,6 +373,8 @@ export const CODEX_CONNECTION_ERROR_CODE = 'codex_connection_failed';
  *  so the user-facing card can say "server-side transient, just retry later"
  *  instead of pointing at the local network. */
 export const CODEX_UPSTREAM_ERROR_CODE = 'codex_upstream_error';
+/** Explicit model capacity refusal; generic 5xx/stream errors stay upstream. */
+export const CODEX_CAPACITY_ERROR_CODE = 'codex_capacity_exceeded';
 export const CODEX_OUTPUT_LIMIT_ERROR_CODE = 'codex_output_limit_exceeded';
 export const CODEX_TASK_FAILED_ERROR_CODE = 'codex_task_failed';
 export const CODEX_OUTPUT_LIMIT_ERROR_MESSAGE = 'model output limit exceeded: max_output_tokens';
@@ -449,6 +451,21 @@ function codexFailureLeaf(error: unknown): unknown {
     break;
   }
   return current;
+}
+
+/** Opt-in capacity discriminator for Codex recovery, separate from the shared
+ * Codex-family taxonomy so TraeX and other readers retain their policy. */
+export function isCodexCapacityError(error: unknown): boolean {
+  if ([CODEX_RATE_LIMIT_ERROR_CODE, CODEX_AUTH_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE]
+    .includes(codexTaskFailureCode(error))) return false;
+  const leaf = codexFailureLeaf(error);
+  if (leaf && typeof leaf === 'object') {
+    const record = leaf as Record<string, unknown>;
+    const code = record.codex_error_info ?? record.codexErrorInfo ?? record.code;
+    if (typeof code === 'string' && /^server_?overloaded$/i.test(code)) return true;
+    return record.message === 'Selected model is at capacity. Please try a different model.';
+  }
+  return leaf === 'Selected model is at capacity. Please try a different model.';
 }
 
 /** Bounded, redacted user-facing summary of a structured task_complete error.
@@ -1508,7 +1525,8 @@ export function drainCodexRollout(
         text: typeof p.last_agent_message === 'string' ? p.last_agent_message : '',
         ...(failed ? {
           terminalStatus: 'failed' as const,
-          terminalErrorCode: codexTaskFailureCode(p.error),
+          terminalErrorCode: isCodexCapacityError(p.error)
+            ? CODEX_CAPACITY_ERROR_CODE : codexTaskFailureCode(p.error),
           terminalErrorSummary: safeFailureSummary(p.error),
         } : {}),
         sourceTurnId: p.turn_id,
