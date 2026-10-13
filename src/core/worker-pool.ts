@@ -1735,6 +1735,9 @@ function ordinaryTurnRecoveryWarning(
   if (state.lastErrorCode === 'recovery_dispatch_interrupted') {
     return tr('worker.ordinary_recovery_dispatch_interrupted', { cliName }, locale);
   }
+  if (state.lastErrorCode === 'recovery_restart_unverified') {
+    return tr('worker.ordinary_recovery_restart_unverified', { cliName }, locale);
+  }
   if (state.lastErrorCode === 'recovery_persist_failed') {
     return tr('worker.ordinary_recovery_persist_failed', { cliName }, locale);
   }
@@ -1806,24 +1809,26 @@ export function ensureOrdinaryTurnRecoveryAttached(
   for (const turnId of ordinaryTurnRecoverySilentTurnIds(ds.session.ordinaryTurnRecovery)) {
     if (!isSilentScheduledTurn(ds, turnId)) armSilentScheduledTurn(ds, turnId);
   }
+  const onRecoveryError = (err: unknown): void => {
+    logger.error(`[${tag(ds)}] Recovery persistence failed: ${err instanceof Error ? err.message : String(err)}`);
+    try {
+      const turnId = ds.session.ordinaryTurnRecovery?.currentTurnId;
+      if (turnId) requireOrdinaryTurnRecoveryAttention(ds.session, turnId, 'recovery_persist_failed');
+    } catch (persistError) {
+      logger.error(`[${tag(ds)}] Could not persist recovery attention: ${persistError instanceof Error ? persistError.message : String(persistError)}`);
+    }
+  };
   attachOrdinaryTurnRecovery(ds.session, {
+    onError: onRecoveryError,
     ...(sessionCliId(ds, botCfg) === 'codex' ? {
       recoverableErrorCodes: [CODEX_CAPACITY_ERROR_CODE],
       supersedeOnUserInput: true,
+      resumeBackoffOnRestore: false,
       backoffMs: [15_000, 45_000],
     } : {}),
     schedule: (delayMs, run) => {
       const timer = setTimeout(() => {
-        try { run(); } catch (err) {
-          logger.error(`[${tag(ds)}] Recovery timer persistence failed: ${err instanceof Error ? err.message : String(err)}`);
-          try {
-            const turnId = ds.session.ordinaryTurnRecovery?.currentTurnId;
-            if (turnId) requireOrdinaryTurnRecoveryAttention(ds.session, turnId, 'recovery_persist_failed');
-          }
-          catch (persistError) {
-            logger.error(`[${tag(ds)}] Could not persist recovery attention: ${persistError instanceof Error ? persistError.message : String(persistError)}`);
-          }
-        }
+        try { run(); } catch (err) { onRecoveryError(err); }
       }, delayMs);
       timer.unref?.();
       return timer;

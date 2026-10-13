@@ -7841,3 +7841,25 @@ describe('Codex capacity recovery', () => {
     expect(ds.session.ordinaryTurnRecovery?.status).toBe('completed');
   });
 });
+
+it('an admitted Codex successor fences old recovery even when saving its new state fails', async () => {
+  vi.useFakeTimers();
+  const ds = makeDs();
+  forkWorker(ds, 'original task', 'om_original');
+  const worker = forkMock.mock.results.at(-1)!.value;
+  worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+  worker.emit('message', { type: 'turn_input_received', turnId: 'om_original' });
+  worker.emit('message', { type: 'turn_input_committed', turnId: 'om_original' });
+  await vi.advanceTimersByTimeAsync(0);
+  vi.mocked(worker.send).mockImplementation((_message: any, cb?: (err?: Error | null) => void) => { cb?.(null); return true; });
+  worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_original', status: 'failed', errorCode: 'codex_capacity_exceeded' });
+  await vi.advanceTimersByTimeAsync(0);
+  vi.mocked(sessionStore.updateSession).mockImplementation(s => {
+    if (s.ordinaryTurnRecovery?.logicalTurnId === 'om_new' && s.ordinaryTurnRecovery.status === 'running') throw new Error('disk full after admission');
+  });
+  expect(sendWorkerInput(ds, 'new task', 'om_new')).toBe(true);
+  expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'message', turnId: 'om_new' }), expect.any(Function));
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(ds.session.ordinaryTurnRecovery).toMatchObject({ status: 'cancelled', logicalTurnId: 'om_new' });
+  expect(vi.mocked(worker.send).mock.calls.map(c => c[0] as any).filter(m => m?.turnId?.startsWith('bmx-recovery-'))).toHaveLength(0);
+});

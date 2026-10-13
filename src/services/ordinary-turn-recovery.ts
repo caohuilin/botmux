@@ -119,11 +119,17 @@ export interface OrdinaryTurnRecoveryDeps<TTimer = unknown> {
   schedule: (delayMs: number, run: () => void) => TTimer;
   cancel: (timer: TTimer) => void;
   persist: (state: OrdinaryTurnRecoveryState) => void;
+  /** Keep a fail-closed process-local fence when an admitted user action could
+   * not be saved. Persistence must not resurrect the superseded recovery. */
+  retain?: (state: OrdinaryTurnRecoveryState) => void;
   /** Complete asynchronous, turn-bound setup before the continuation can be
    * enqueued. The coordinator re-checks ownership after this await. */
   prepare?: (dispatch: OrdinaryTurnRecoveryDispatch) => void | Promise<void>;
   enqueue: (dispatch: OrdinaryTurnRecoveryDispatch) => boolean;
   warn: (state: OrdinaryTurnRecoveryState) => void;
+  /** Async dispatch failures do not pass through the host's timer try/catch.
+   * Report them while retaining the persisted handoff fence (never replay). */
+  onError?: (error: unknown) => void;
   /** Identity for the next continuation of `logicalTurnId`. Return undefined
    *  to keep the default `bmx-recovery-<random>` id. The daemon uses this to
    *  keep a scheduled turn's `schedule:<taskId>:<uuid>` provenance on its
@@ -137,6 +143,9 @@ export interface OrdinaryTurnRecoveryDeps<TTimer = unknown> {
   recoverableErrorCodes?: readonly string[];
   /** Codex newer input supersedes the old recovery even during execution. */
   supersedeOnUserInput?: boolean;
+  /** A newer user action may have failed to persist before the old process
+   * exited. Without durable proof of ownership, do not rearm its backoff. */
+  resumeBackoffOnRestore?: boolean;
 }
 
 export interface OrdinaryTurnRecoverySession {
@@ -149,6 +158,7 @@ export interface OrdinaryTurnRecoverySession {
 type AttachedRecovery = {
   session: OrdinaryTurnRecoverySession;
   coordinator: OrdinaryTurnRecoveryCoordinator<any>;
+  cancelActive: boolean;
   dispose: () => void;
 };
 
@@ -213,6 +223,14 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
         ...(opts.silent ? { silentLogicalTurnIds: [logicalTurnId] } : {}),
       });
     } catch (err) {
+      if (this.deps.supersedeOnUserInput) {
+        this.retain({
+          logicalTurnId, currentTurnId: logicalTurnId, continuationsStarted: 0,
+          status: 'cancelled', cancelledByTurnId: logicalTurnId,
+          lastErrorCode: 'recovery_persist_failed',
+        });
+        throw err;
+      }
       if (wasBackoff) this.armBackoff();
       throw err;
     }
@@ -342,6 +360,16 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
         cancelledByTurnId: turnId,
       });
     } catch (err) {
+      if (this.deps.supersedeOnUserInput) {
+        // The stop/new input is real even if its storage outcome is unknown.
+        // Retain the cancellation locally and still let the host send Ctrl+C.
+        const cancelled = {
+          ...current, status: 'cancelled' as const, nextAttemptAt: undefined,
+          cancelledByTurnId: turnId, lastErrorCode: 'recovery_persist_failed',
+        };
+        this.retain(cancelled);
+        return cancelled;
+      }
       if (wasBackoff) this.armBackoff();
       throw err;
     }
@@ -409,7 +437,11 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
       try {
         const preparation = this.deps.prepare?.(dispatch);
         if (preparation && typeof (preparation as Promise<void>).then === 'function') {
-          void Promise.resolve(preparation).then(finish, failPreparation);
+          void Promise.resolve(preparation).then(finish, failPreparation).catch(error => {
+            // The input may already have been accepted. Keep the exact durable
+            // dispatching identity; the host stops recovery and raises attention.
+            try { this.deps.onError?.(error); } catch { /* reporting must not reject */ }
+          });
         } else {
           finish();
         }
@@ -441,6 +473,11 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
       throw err;
     }
     return next;
+  }
+
+  private retain(state: OrdinaryTurnRecoveryState): void {
+    this.state = pruneSilentLogicalTurnIds({ ...state });
+    this.deps.retain?.(this.state);
   }
 
   private cancelTimer(): void {
@@ -476,6 +513,10 @@ export function attachOrdinaryTurnRecovery<TTimer>(
   let coordinator!: OrdinaryTurnRecoveryCoordinator<TTimer>;
   const wrapped: OrdinaryTurnRecoveryDeps<TTimer> = {
     ...deps,
+    retain: state => {
+      session.ordinaryTurnRecovery = structuredClone(state);
+      deps.retain?.(state);
+    },
     persist: state => {
       const prior = session.ordinaryTurnRecovery;
       session.ordinaryTurnRecovery = structuredClone(state);
@@ -517,15 +558,18 @@ export function attachOrdinaryTurnRecovery<TTimer>(
   attachedRecoveries.set(session.sessionId, {
     session,
     coordinator,
+    cancelActive: deps.supersedeOnUserInput === true,
     dispose: () => coordinator.dispose(),
   });
   if (session.ordinaryTurnRecovery) {
-    if (session.ordinaryTurnRecovery.status === 'dispatching') {
+    if (session.ordinaryTurnRecovery.status === 'dispatching'
+      || (session.ordinaryTurnRecovery.status === 'backoff' && deps.resumeBackoffOnRestore === false)) {
+      const pendingBackoff = session.ordinaryTurnRecovery.status === 'backoff';
       const wasAlreadyDispatched = session.ordinaryTurnRecovery.warningDispatched === true;
       const interrupted = {
         ...session.ordinaryTurnRecovery,
         status: 'attention_required' as const,
-        lastErrorCode: 'recovery_dispatch_interrupted',
+        lastErrorCode: pendingBackoff ? 'recovery_restart_unverified' : 'recovery_dispatch_interrupted',
         alertSentAt: session.ordinaryTurnRecovery.alertSentAt ?? Date.now(),
         warningDispatched: true,
       };
@@ -597,8 +641,10 @@ export function cancelOrdinaryTurnRecoveryForUserInput(
 ): OrdinaryTurnRecoveryState | undefined {
   const attached = attachedRecoveries.get(session.sessionId);
   if (!attached || !session.ordinaryTurnRecovery
-    || !['backoff', 'exhausted', 'attention_required']
-      .includes(session.ordinaryTurnRecovery.status)) return session.ordinaryTurnRecovery;
+    || (!['backoff', 'exhausted', 'attention_required'].includes(session.ordinaryTurnRecovery.status)
+      && !(attached.cancelActive && ['running', 'dispatching'].includes(session.ordinaryTurnRecovery.status)))) {
+    return session.ordinaryTurnRecovery;
+  }
   return attached.coordinator.cancelForUserInput(turnId);
 }
 
