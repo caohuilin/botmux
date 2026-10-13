@@ -1823,7 +1823,7 @@ export function ensureOrdinaryTurnRecoveryAttached(
     ...(sessionCliId(ds, botCfg) === 'codex' ? {
       recoverableErrorCodes: [CODEX_CAPACITY_ERROR_CODE],
       supersedeOnUserInput: true,
-      resumeBackoffOnRestore: false,
+      resumeRecoveryOnRestore: false,
       backoffMs: [15_000, 45_000],
     } : {}),
     schedule: (delayMs, run) => {

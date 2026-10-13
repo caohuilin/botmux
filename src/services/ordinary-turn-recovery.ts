@@ -145,7 +145,7 @@ export interface OrdinaryTurnRecoveryDeps<TTimer = unknown> {
   supersedeOnUserInput?: boolean;
   /** A newer user action may have failed to persist before the old process
    * exited. Without durable proof of ownership, do not rearm its backoff. */
-  resumeBackoffOnRestore?: boolean;
+  resumeRecoveryOnRestore?: boolean;
 }
 
 export interface OrdinaryTurnRecoverySession {
@@ -169,6 +169,7 @@ const attachedRecoveries = new Map<string, AttachedRecovery>();
 export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
   private state: OrdinaryTurnRecoveryState | undefined;
   private timer: TTimer | undefined;
+  private restoredRunningWithoutRecoveryAuthority = false;
   private readonly now: () => number;
   private readonly randomId: () => string;
   private readonly backoffMs: readonly number[];
@@ -182,6 +183,11 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
   restore(state: OrdinaryTurnRecoveryState): void {
     this.cancelTimer();
     this.state = { ...state };
+    // Observe an already admitted execution, including its successful result,
+    // but the old durable row cannot authorise another continuation after
+    // cancellation/new-input persistence may have failed in the old process.
+    this.restoredRunningWithoutRecoveryAuthority = state.status === 'running'
+      && this.deps.resumeRecoveryOnRestore === false;
     if (this.state.status === 'backoff') this.armBackoff();
   }
 
@@ -215,13 +221,15 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
     const wasBackoff = this.state?.status === 'backoff';
     this.cancelTimer();
     try {
-      return this.commit({
+      const begun = this.commit({
         logicalTurnId,
         currentTurnId: logicalTurnId,
         continuationsStarted: 0,
         status: 'running',
         ...(opts.silent ? { silentLogicalTurnIds: [logicalTurnId] } : {}),
       });
+      this.restoredRunningWithoutRecoveryAuthority = false;
+      return begun;
     } catch (err) {
       if (this.deps.supersedeOnUserInput) {
         this.retain({
@@ -286,6 +294,9 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
       return this.commit({ ...current, status: 'cancelled', nextAttemptAt: undefined });
     }
     if (terminal.errorCode === 'provider_rate_limited') return current;
+    if (this.restoredRunningWithoutRecoveryAuthority) {
+      return this.requireAttention(current, 'recovery_restart_unverified');
+    }
     if (terminal.status !== 'failed'
       || terminal.retryable === false
       || (!this.deps.recoverableErrorCodes && terminal.retryable !== true)) {
@@ -563,7 +574,7 @@ export function attachOrdinaryTurnRecovery<TTimer>(
   });
   if (session.ordinaryTurnRecovery) {
     if (session.ordinaryTurnRecovery.status === 'dispatching'
-      || (session.ordinaryTurnRecovery.status === 'backoff' && deps.resumeBackoffOnRestore === false)) {
+      || (session.ordinaryTurnRecovery.status === 'backoff' && deps.resumeRecoveryOnRestore === false)) {
       const pendingBackoff = session.ordinaryTurnRecovery.status === 'backoff';
       const wasAlreadyDispatched = session.ordinaryTurnRecovery.warningDispatched === true;
       const interrupted = {
