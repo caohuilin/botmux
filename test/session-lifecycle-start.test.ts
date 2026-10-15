@@ -7944,6 +7944,35 @@ describe('Codex capacity recovery', () => {
     expect(continuations(worker)).toHaveLength(0);
   });
 
+  it('opt-off followed by a diagnostic before the timer settles once without a second card', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_capacity', status: 'failed', errorCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(1_000);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: false }));
+    worker.emit('message', { type: 'final_output', turnId: 'om_capacity', lastUuid: 'before-opt-off-timer', content: 'capacity diagnostic', turnFailed: true, turnFailureCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('cancelled');
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(sessionReply).toHaveBeenCalledOnce();
+  });
+
+  it('turning recovery off after success still suppresses the already recovered predecessor diagnostic', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_capacity', status: 'failed', errorCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(15_000);
+    const turnId = continuations(worker)[0].turnId;
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId, status: 'completed' });
+    await vi.advanceTimersByTimeAsync(0);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: false }));
+    worker.emit('message', { type: 'final_output', turnId: 'om_capacity', lastUuid: 'success-then-opt-off', content: 'obsolete diagnostic', turnFailed: true, turnFailureCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(continuations(worker)).toHaveLength(1);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('completed');
+  });
+
   it('opt-off save failure still fences the pending recovery and reports its failure once', async () => {
     const { ds, worker, sessionReply } = await boot();
     fail(ds, worker);
@@ -7966,6 +7995,7 @@ describe('Codex capacity recovery', () => {
     await vi.advanceTimersByTimeAsync(60_000);
     expect(continuations(worker)).toHaveLength(0);
     expect(sessionReply).toHaveBeenCalledOnce();
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('cancelled');
   });
 
   it('continues capacity failures twice with backoff and one actionable exhaustion card', async () => {

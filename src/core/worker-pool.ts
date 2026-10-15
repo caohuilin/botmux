@@ -1908,13 +1908,15 @@ function notifyOrdinaryTurnRecoveryFailure(
 function disposeIneligibleOrdinaryTurnRecovery(
   ds: DaemonSession,
   botCfg = getBot(ds.larkAppId).config,
+  failedCapacityTurnId?: string,
 ): void {
   try {
     const current = ds.session.ordinaryTurnRecovery;
     if (sessionCliId(ds, botCfg) === 'codex' && botCfg.codexCapacityRecovery !== true
       && ordinaryTurnRecoveryEligible(ds, { ...botCfg, codexCapacityRecovery: true })
       && ordinaryTurnRecoveryStillOwnsSession(ds)
-      && current && ['backoff', 'dispatching'].includes(current.status)) {
+      && current && (['backoff', 'dispatching'].includes(current.status)
+        || (current.status === 'running' && current.currentTurnId === failedCapacityTurnId))) {
       cancelOrdinaryRecoveryForUserInput(ds.session, 'recovery_disabled');
       const cancelled = {
         ...current, status: 'cancelled' as const, nextAttemptAt: undefined,
@@ -16891,7 +16893,10 @@ function setupWorkerHandlers(
           try { cancelOrdinaryRecoveryForUserInput(ds.session, msg.turnId); }
           catch (err) { logger.error(`[${t}] Failed to cancel HTTP recovery: ${err instanceof Error ? err.message : String(err)}`); }
         }
-        if (!ordinaryTurnRecoveryEligible(ds)) disposeIneligibleOrdinaryTurnRecovery(ds);
+        if (!ordinaryTurnRecoveryEligible(ds)) {
+          disposeIneligibleOrdinaryTurnRecovery(ds, getBot(ds.larkAppId).config,
+            msg.status === 'failed' && msg.errorCode === CODEX_CAPACITY_ERROR_CODE ? msg.turnId : undefined);
+        }
         const recoveryOwnsTerminal = (!ordinaryHttpTerminal && ordinaryTurnRecoveryHandlesTerminal(ds.session, msg))
           || readonlyContinuationOwnsTerminal;
         let recoveryHandled = false;
@@ -18714,17 +18719,23 @@ function deliverFinalOutput(
     // The ordered terminal IPC owns persistence and the backoff decision. Hide
     // only the diagnostic for a live, exact capacity-recovery owner; HTTP,
     // adopted, superseded and unrelated failure paths keep their normal UI.
+    const capacityDiagnostic = sessionCliId(ds, getBot(ds.larkAppId).config) === 'codex'
+      && msg.turnFailureCode === CODEX_CAPACITY_ERROR_CODE;
+    const terminal = { turnId: msg.turnId, status: 'failed' as const, errorCode: msg.turnFailureCode };
+    if (capacityDiagnostic && !ordinaryTurnRecoveryEligible(ds)
+      && ordinaryTurnRecoveryHandlesTerminal(ds.session, terminal)) {
+      // A diagnostic can reach this path before the backoff timer observes
+      // opt-out. Settle through the same one-notice path and cancel that timer.
+      disposeIneligibleOrdinaryTurnRecovery(ds, getBot(ds.larkAppId).config, msg.turnId);
+    }
     const recovery = ds.session.ordinaryTurnRecovery;
-    const disabledNoticeOwnsTurn = recovery?.status === 'cancelled'
-      && recovery.lastErrorCode === 'recovery_disabled' && recovery.warningDispatched === true
-      && (recovery.currentTurnId === msg.turnId
-        || (recovery.continuationsStarted > 0 && recovery.logicalTurnId === msg.turnId));
-    if (sessionCliId(ds, getBot(ds.larkAppId).config) === 'codex'
-      && msg.turnFailureCode === CODEX_CAPACITY_ERROR_CODE
-      && (disabledNoticeOwnsTurn || (ordinaryTurnRecoveryEligible(ds)
-        && ordinaryTurnRecoveryHandlesTerminal(ds.session, {
-          turnId: msg.turnId, status: 'failed', errorCode: msg.turnFailureCode,
-        })))) {
+    const predecessor = recovery && recovery.continuationsStarted > 0 && recovery.logicalTurnId === msg.turnId;
+    const recordedNoticeOwnsTurn = recovery?.warningDispatched === true
+      && (recovery.currentTurnId === msg.turnId || predecessor);
+    const completedPredecessor = recovery?.status === 'completed' && predecessor;
+    if (capacityDiagnostic
+      && (recordedNoticeOwnsTurn || completedPredecessor || (ordinaryTurnRecoveryEligible(ds)
+        && ordinaryTurnRecoveryHandlesTerminal(ds.session, terminal)))) {
       ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
       onComplete?.(true);
       return;
