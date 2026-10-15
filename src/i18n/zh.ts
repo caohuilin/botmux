@@ -1244,6 +1244,7 @@ export const messages: Record<string, string> = {
   'worker.empty_final_failed_connection': '⚠️ {cliName} 连接模型服务失败：{reason}\n请检查网络与模型服务状态，恢复后重发消息。',
   'worker.empty_final_failed_upstream': '⚠️ {cliName} 遇到模型网关/上游服务故障：{reason}\n这是服务端暂态错误，与你的消息内容无关；请稍后重发消息重试。',
   'worker.codex_capacity_recovery_stopped': '⚠️ {cliName} 模型容量不足，当前停止自动恢复。请稍后点击「继续」恢复原任务，或切换模型后继续。',
+  'worker.ordinary_recovery_disabled': '⚠️ {cliName} 的容量自动恢复已关闭，本轮停止续跑。请检查已有进度，需要时点击「继续」手动恢复。',
   'worker.ordinary_recovery_persist_failed': '⚠️ {cliName} 自动续跑状态保存失败，已停止自动处理。请检查 Web 终端中的已有进度后再继续。',
   'worker.ordinary_recovery_restart_unverified': '⚠️ Botmux 重启后已暂停 {cliName} 的待恢复任务。请检查已完成的进度，再点击「继续」恢复原任务。',
   'worker.ordinary_recovery_exhausted': '⚠️ {cliName} 因暂态模型服务故障中断，Botmux 已自动续跑 2 次但仍未恢复。会话已停止自动续跑，避免重复外部操作；请检查 Web 终端和模型服务状态后，再发送一条消息继续。',

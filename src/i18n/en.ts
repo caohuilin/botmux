@@ -1245,6 +1245,7 @@ export const messages: Record<string, string> = {
   'worker.empty_final_failed_connection': '⚠️ {cliName} could not connect to the model service: {reason}\nCheck the network and model-service status, then resend the message.',
   'worker.empty_final_failed_upstream': '⚠️ {cliName} hit a model gateway / upstream service failure: {reason}\nThis is a transient server-side error unrelated to your message. Wait a moment, then resend the message.',
   'worker.codex_capacity_recovery_stopped': '⚠️ {cliName} model capacity is unavailable. Automatic recovery stopped. Use Continue later to resume the task, or change models and continue.',
+  'worker.ordinary_recovery_disabled': '⚠️ {cliName} capacity recovery was turned off, so this pending continuation was cancelled. Check existing progress and use Continue to resume manually if needed.',
   'worker.ordinary_recovery_persist_failed': '⚠️ {cliName} automatic recovery state could not be saved. Automatic processing stopped. Check existing progress in the Web Terminal before continuing.',
   'worker.ordinary_recovery_restart_unverified': '⚠️ Botmux restarted and paused the pending {cliName} recovery. Check completed progress, then use Continue to resume the task.',
   'worker.ordinary_recovery_exhausted': '⚠️ {cliName} stopped because of a transient model-service failure. Botmux continued the session twice, but it still did not recover. Automatic continuation is now stopped to avoid repeating external side effects. Check the Web Terminal and model-service status, then send a message to continue.',

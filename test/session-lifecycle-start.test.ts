@@ -7902,7 +7902,7 @@ describe('Codex capacity recovery', () => {
   });
 
   it('does not restore an old persisted Codex backoff when the opt-in is absent', async () => {
-    const { ds, worker } = await boot({ codexCapacityRecovery: undefined });
+    const { ds, worker, sessionReply } = await boot({ codexCapacityRecovery: undefined });
     ds.session.ordinaryTurnRecovery = {
       logicalTurnId: 'om_capacity', currentTurnId: 'om_capacity', status: 'backoff', continuationsStarted: 0,
       nextAttemptAt: Date.now() - 1, lastErrorCode: 'codex_capacity_exceeded',
@@ -7910,17 +7910,52 @@ describe('Codex capacity recovery', () => {
     expect(ensureOrdinaryTurnRecoveryAttached(ds)).toBe(false);
     await vi.advanceTimersByTimeAsync(60_000);
     expect(continuations(worker)).toHaveLength(0);
+    expect(ds.session.ordinaryTurnRecovery).toMatchObject({ status: 'cancelled', warningDispatched: true });
+    expect(sessionReply).toHaveBeenCalledOnce();
   });
 
-  it('turning the opt-in off during backoff prevents the pending input and preserves diagnostic delivery', async () => {
+  it.each(['final-first', 'terminal-first'] as const)('opt-off mid-backoff settles durably and sends one card (%s)', async order => {
     const { ds, worker, sessionReply } = await boot();
-    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_capacity', status: 'failed', errorCode: 'codex_capacity_exceeded' });
+    let durable: any;
+    vi.mocked(sessionStore.updateSession).mockImplementation(s => { durable = structuredClone(s.ordinaryTurnRecovery); });
+    if (order === 'final-first') fail(ds, worker);
+    else worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_capacity', status: 'failed', errorCode: 'codex_capacity_exceeded' });
     await vi.advanceTimersByTimeAsync(1_000);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('backoff');
     vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: false }));
     await vi.advanceTimersByTimeAsync(60_000);
     expect(continuations(worker)).toHaveLength(0);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(ds.agentAttention).toBeDefined();
+    expect(durable).toMatchObject({ status: 'cancelled', lastErrorCode: 'recovery_disabled', warningDispatched: true });
+    // A late rollout must not duplicate the explicit opt-off notice.
     worker.emit('message', { type: 'final_output', turnId: 'om_capacity', lastUuid: 'disabled-diagnostic', content: 'capacity diagnostic', turnFailed: true, turnFailureCode: 'codex_capacity_exceeded' });
     await vi.advanceTimersByTimeAsync(0);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    const { disposeOrdinaryTurnRecovery } = await import('../src/services/ordinary-turn-recovery.js');
+    disposeOrdinaryTurnRecovery(ds.session);
+    // Fresh process with only the durable row, and the feature enabled again.
+    const restored = makeDs({ session: { ...structuredClone(ds.session), ordinaryTurnRecovery: structuredClone(durable) } });
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: true }));
+    ensureOrdinaryTurnRecoveryAttached(restored);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(restored.session.ordinaryTurnRecovery?.status).toBe('cancelled');
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(continuations(worker)).toHaveLength(0);
+  });
+
+  it('opt-off save failure still fences the pending recovery and reports its failure once', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(1_000);
+    vi.mocked(sessionStore.updateSession).mockImplementation(s => {
+      if (s.ordinaryTurnRecovery?.status === 'cancelled') throw new Error('disk full on opt-off');
+    });
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: false }));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(ds.session.ordinaryTurnRecovery).toMatchObject({ status: 'cancelled', warningDispatched: true });
+    expect(ds.agentAttention).toBeDefined();
     expect(sessionReply).toHaveBeenCalledOnce();
   });
 

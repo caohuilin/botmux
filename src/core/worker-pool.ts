@@ -1796,6 +1796,9 @@ function ordinaryTurnRecoveryWarning(
   if (state.status === 'exhausted' && state.continuationsStarted >= 2) {
     return tr('worker.ordinary_recovery_exhausted', { cliName }, locale);
   }
+  if (state.lastErrorCode === 'recovery_disabled') {
+    return tr('worker.ordinary_recovery_disabled', { cliName }, locale);
+  }
   if (state.lastErrorCode === 'recovery_enqueue_failed') {
     return tr('worker.ordinary_recovery_enqueue_failed', { cliName }, locale);
   }
@@ -1862,6 +1865,75 @@ function buildSessionTurnFailedCard(
   });
 }
 
+function notifyOrdinaryTurnRecoveryFailure(
+  ds: DaemonSession,
+  state: NonNullable<Session['ordinaryTurnRecovery']>,
+  botCfg = getBot(ds.larkAppId).config,
+): void {
+  const warning = ordinaryTurnRecoveryWarning(state, localeForBot(ds.larkAppId), sessionCliDisplayName(ds, botCfg), sessionCliId(ds, botCfg));
+  ds.agentAttention = {
+    kind: 'blocked',
+    reason: warning,
+    at: state.alertSentAt ?? Date.now(),
+  };
+  publishAttentionPatch(ds);
+  emitSessionLifecycleHook(ds, 'session.requires_attention', {
+    reason: 'ordinary_turn_recovery_exhausted',
+    errorCode: state.lastErrorCode,
+    logicalTurnId: state.logicalTurnId,
+  });
+  void requireCallbacks().sessionReply(
+    sessionAnchorId(ds),
+    buildSessionTurnFailedCard(ds, {
+      status: 'failed',
+      reason: warning,
+      ...(state.lastErrorCode !== undefined ? { errorCode: state.lastErrorCode } : {}),
+      // Include attempted continuations for both exhausted and opted-out
+      // recovery, so the user can see how far automatic handling got.
+      continuations: state.continuationsStarted,
+      // A recovery failure or opt-out does not prove that no side effects
+      // ran. Leave retry safety to the shared error-code policy.
+    }),
+    'interactive',
+    ds.larkAppId,
+    state.logicalTurnId,
+  ).catch(err => logger.error(
+    `[${tag(ds)}] Failed to deliver ordinary-turn recovery warning: `
+    + `${err instanceof Error ? err.message : String(err)}`,
+  ));
+}
+
+/** Opting out settles a pending failure before removing its runtime owner.
+ * The persisted notice receipt also owns any later capacity diagnostic. */
+function disposeIneligibleOrdinaryTurnRecovery(
+  ds: DaemonSession,
+  botCfg = getBot(ds.larkAppId).config,
+): void {
+  try {
+    const current = ds.session.ordinaryTurnRecovery;
+    if (sessionCliId(ds, botCfg) === 'codex' && botCfg.codexCapacityRecovery !== true
+      && ordinaryTurnRecoveryEligible(ds, { ...botCfg, codexCapacityRecovery: true })
+      && ordinaryTurnRecoveryStillOwnsSession(ds)
+      && current && ['backoff', 'dispatching'].includes(current.status)) {
+      cancelOrdinaryRecoveryForUserInput(ds.session, 'recovery_disabled');
+      const cancelled = {
+        ...current, status: 'cancelled' as const, nextAttemptAt: undefined,
+        cancelledByTurnId: 'recovery_disabled', lastErrorCode: 'recovery_disabled',
+        alertSentAt: current.alertSentAt ?? Date.now(), warningDispatched: true,
+      };
+      // Keep the cancellation/notice fence in memory even if disk is full.
+      ds.session.ordinaryTurnRecovery = cancelled;
+      try { sessionStore.updateSession(ds.session); }
+      catch (error) {
+        logger.error(`[${tag(ds)}] Could not persist disabled capacity recovery: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      if (!current.warningDispatched) notifyOrdinaryTurnRecoveryFailure(ds, cancelled, botCfg);
+    }
+  } finally {
+    disposeOrdinaryTurnRecovery(ds.session);
+  }
+}
+
 /** Attach the crash-safe timer owner for one eligible ordinary Claude/Lark
  * session. Session state is persisted; this runtime registry only owns timers. */
 export function ensureOrdinaryTurnRecoveryAttached(
@@ -1869,7 +1941,7 @@ export function ensureOrdinaryTurnRecoveryAttached(
   botCfg = getBot(ds.larkAppId).config,
 ): boolean {
   if (!ordinaryTurnRecoveryEligible(ds, botCfg)) {
-    disposeOrdinaryTurnRecovery(ds.session);
+    disposeIneligibleOrdinaryTurnRecovery(ds, botCfg);
     return false;
   }
   // Re-arm the runtime silent registry from the persisted recovery state BEFORE
@@ -1900,7 +1972,7 @@ export function ensureOrdinaryTurnRecoveryAttached(
       const timer = setTimeout(() => {
         try {
           if (!ordinaryTurnRecoveryEligible(ds)) {
-            disposeOrdinaryTurnRecovery(ds.session);
+            disposeIneligibleOrdinaryTurnRecovery(ds);
             return;
           }
           run();
@@ -1956,39 +2028,7 @@ export function ensureOrdinaryTurnRecoveryAttached(
       if (!enqueued && silent) disarmSilentScheduledTurn(ds, dispatch.turnId);
       return enqueued;
     },
-    warn: state => {
-      const warning = ordinaryTurnRecoveryWarning(state, localeForBot(ds.larkAppId), sessionCliDisplayName(ds, botCfg), sessionCliId(ds, botCfg));
-      ds.agentAttention = {
-        kind: 'blocked',
-        reason: warning,
-        at: state.alertSentAt ?? Date.now(),
-      };
-      publishAttentionPatch(ds);
-      emitSessionLifecycleHook(ds, 'session.requires_attention', {
-        reason: 'ordinary_turn_recovery_exhausted',
-        errorCode: state.lastErrorCode,
-        logicalTurnId: state.logicalTurnId,
-      });
-      void requireCallbacks().sessionReply(
-        sessionAnchorId(ds),
-        buildSessionTurnFailedCard(ds, {
-          status: 'failed',
-          reason: warning,
-          ...(state.lastErrorCode !== undefined ? { errorCode: state.lastErrorCode } : {}),
-          // recovery 走到 warn 一定是「自动续跑救不回来」，把已试次数摊给用户，
-          // 免得他以为系统什么都没做。
-          continuations: state.continuationsStarted,
-          // 这条路径的 retryable 已经在 coordinator 里判过并否掉了（否则不会
-          // warn），所以按钮的安全性交给 errorCode 白名单判断，不再谎称 safe。
-        }),
-        'interactive',
-        ds.larkAppId,
-        state.logicalTurnId,
-      ).catch(err => logger.error(
-        `[${tag(ds)}] Failed to deliver ordinary-turn recovery warning: `
-        + `${err instanceof Error ? err.message : String(err)}`,
-      ));
-    },
+    warn: state => notifyOrdinaryTurnRecoveryFailure(ds, state, botCfg),
   });
   const restored = ds.session.ordinaryTurnRecovery;
   if (restored?.alertSentAt
@@ -16851,7 +16891,7 @@ function setupWorkerHandlers(
           try { cancelOrdinaryRecoveryForUserInput(ds.session, msg.turnId); }
           catch (err) { logger.error(`[${t}] Failed to cancel HTTP recovery: ${err instanceof Error ? err.message : String(err)}`); }
         }
-        if (!ordinaryTurnRecoveryEligible(ds)) disposeOrdinaryTurnRecovery(ds.session);
+        if (!ordinaryTurnRecoveryEligible(ds)) disposeIneligibleOrdinaryTurnRecovery(ds);
         const recoveryOwnsTerminal = (!ordinaryHttpTerminal && ordinaryTurnRecoveryHandlesTerminal(ds.session, msg))
           || readonlyContinuationOwnsTerminal;
         let recoveryHandled = false;
@@ -18674,12 +18714,17 @@ function deliverFinalOutput(
     // The ordered terminal IPC owns persistence and the backoff decision. Hide
     // only the diagnostic for a live, exact capacity-recovery owner; HTTP,
     // adopted, superseded and unrelated failure paths keep their normal UI.
+    const recovery = ds.session.ordinaryTurnRecovery;
+    const disabledNoticeOwnsTurn = recovery?.status === 'cancelled'
+      && recovery.lastErrorCode === 'recovery_disabled' && recovery.warningDispatched === true
+      && (recovery.currentTurnId === msg.turnId
+        || (recovery.continuationsStarted > 0 && recovery.logicalTurnId === msg.turnId));
     if (sessionCliId(ds, getBot(ds.larkAppId).config) === 'codex'
-      && ordinaryTurnRecoveryEligible(ds)
       && msg.turnFailureCode === CODEX_CAPACITY_ERROR_CODE
-      && ordinaryTurnRecoveryHandlesTerminal(ds.session, {
-        turnId: msg.turnId, status: 'failed', errorCode: msg.turnFailureCode,
-      })) {
+      && (disabledNoticeOwnsTurn || (ordinaryTurnRecoveryEligible(ds)
+        && ordinaryTurnRecoveryHandlesTerminal(ds.session, {
+          turnId: msg.turnId, status: 'failed', errorCode: msg.turnFailureCode,
+        })))) {
       ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
       onComplete?.(true);
       return;
