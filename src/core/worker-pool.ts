@@ -1748,7 +1748,7 @@ function ordinaryTurnRecoveryEligible(
   botCfg = getBot(ds.larkAppId).config,
 ): boolean {
   const cliId = sessionCliId(ds, botCfg);
-  return (cliId === 'claude-code' || (cliId === 'codex' && !ds.adoptedFrom && !ds.session.adoptedFrom))
+  return (cliId === 'claude-code' || (cliId === 'codex' && botCfg.codexCapacityRecovery === true && !ds.adoptedFrom && !ds.session.adoptedFrom))
     && ds.session.status === 'active'
     && !isSharedAdoptSession(ds)
     && !ds.session.vcMeetingReceiver
@@ -1898,7 +1898,13 @@ export function ensureOrdinaryTurnRecoveryAttached(
     } : {}),
     schedule: (delayMs, run) => {
       const timer = setTimeout(() => {
-        try { run(); } catch (err) { onRecoveryError(err); }
+        try {
+          if (!ordinaryTurnRecoveryEligible(ds)) {
+            disposeOrdinaryTurnRecovery(ds.session);
+            return;
+          }
+          run();
+        } catch (err) { onRecoveryError(err); }
       }, delayMs);
       timer.unref?.();
       return timer;
@@ -16806,6 +16812,7 @@ function setupWorkerHandlers(
           try { cancelOrdinaryRecoveryForUserInput(ds.session, msg.turnId); }
           catch (err) { logger.error(`[${t}] Failed to cancel HTTP recovery: ${err instanceof Error ? err.message : String(err)}`); }
         }
+        if (!ordinaryTurnRecoveryEligible(ds)) disposeOrdinaryTurnRecovery(ds.session);
         const recoveryOwnsTerminal = (!ordinaryHttpTerminal && ordinaryTurnRecoveryHandlesTerminal(ds.session, msg))
           || readonlyContinuationOwnsTerminal;
         let recoveryHandled = false;
@@ -18629,6 +18636,7 @@ function deliverFinalOutput(
     // only the diagnostic for a live, exact capacity-recovery owner; HTTP,
     // adopted, superseded and unrelated failure paths keep their normal UI.
     if (sessionCliId(ds, getBot(ds.larkAppId).config) === 'codex'
+      && ordinaryTurnRecoveryEligible(ds)
       && msg.turnFailureCode === CODEX_CAPACITY_ERROR_CODE
       && ordinaryTurnRecoveryHandlesTerminal(ds.session, {
         turnId: msg.turnId, status: 'failed', errorCode: msg.turnFailureCode,

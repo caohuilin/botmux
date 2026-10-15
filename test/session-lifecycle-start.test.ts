@@ -7838,7 +7838,7 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
 
 describe('Codex capacity recovery', () => {
   async function boot(botOverrides: Record<string, unknown> = {}) {
-    vi.mocked(getBot).mockImplementation(() => defaultBot(botOverrides));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: true, ...botOverrides }));
     vi.useFakeTimers();
     const sessionReply = vi.fn(async () => 'om_card');
     initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() });
@@ -7863,6 +7863,47 @@ describe('Codex capacity recovery', () => {
     worker.emit('message', { type: 'final_output', turnId, lastUuid: turnId, content: 'capacity diagnostic', turnFailed: true, turnFailureCode: errorCode });
     worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId, status: 'failed', errorCode });
   }
+
+  it.each([undefined, false])('does not inject recovery inputs when the opt-in is %s', async codexCapacityRecovery => {
+    const { ds, worker, sessionReply } = await boot({ codexCapacityRecovery });
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(ds.session.ordinaryTurnRecovery).toBeUndefined();
+    expect(sessionReply).toHaveBeenCalledOnce();
+  });
+
+  it('does not restore an old persisted Codex backoff when the opt-in is absent', async () => {
+    const { ds, worker } = await boot({ codexCapacityRecovery: undefined });
+    ds.session.ordinaryTurnRecovery = {
+      logicalTurnId: 'om_capacity', currentTurnId: 'om_capacity', status: 'backoff', continuationsStarted: 0,
+      nextAttemptAt: Date.now() - 1, lastErrorCode: 'codex_capacity_exceeded',
+    };
+    expect(ensureOrdinaryTurnRecoveryAttached(ds)).toBe(false);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+  });
+
+  it('turning the opt-in off during backoff prevents the pending input and preserves diagnostic delivery', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_capacity', status: 'failed', errorCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(1_000);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: false }));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    worker.emit('message', { type: 'final_output', turnId: 'om_capacity', lastUuid: 'disabled-diagnostic', content: 'capacity diagnostic', turnFailed: true, turnFailureCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sessionReply).toHaveBeenCalledOnce();
+  });
+
+  it('turning the opt-in off before failure keeps the normal failure UI', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: false }));
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(sessionReply).toHaveBeenCalledOnce();
+  });
 
   it('continues capacity failures twice with backoff and one actionable exhaustion card', async () => {
     const { ds, worker, sessionReply } = await boot();
@@ -8033,6 +8074,7 @@ describe('Codex capacity recovery', () => {
 });
 
 it('an admitted Codex successor fences old recovery even when saving its new state fails', async () => {
+  vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: true }));
   vi.useFakeTimers();
   const ds = makeDs();
   forkWorker(ds, 'original task', 'om_original');
