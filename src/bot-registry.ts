@@ -1,5 +1,6 @@
 import { parseGroupCreationDefaults, type GroupCreationDefaults } from './services/group-creation-options.js';
 import { readGlobalConfig } from './global-config.js';
+import { getTurnResultRuntime } from './core/turn-result-runtime.js';
 import { parseSandboxNetworkPolicy } from './core/sandbox-network-policy.js';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { normalizeCodexInstancePool, registerCodexInstanceBot, clearCodexInstanceBots, validateCodexInstanceRoster } from './services/codex-instance-pool.js';
@@ -31,6 +32,7 @@ import {
 import { logger } from './utils/logger.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
+import { normalizeGroupIdleClose, type GroupIdleCloseSettings } from './core/group-idle-close.js';
 import { normalizeGroupSerialInput } from './core/group-serial-input.js';
 import { normalizeGroupDefaultModels, type GroupDefaultModels } from './core/group-default-models.js';
 import type { PricingOverrides } from './services/model-pricing.js';
@@ -43,6 +45,7 @@ import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
 import { DAEMON_COMMANDS } from './core/passthrough-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
+import { normalizeDispatchLaunchPolicy } from './core/dispatch-launch-contract.js';
 import { normalizeEnvPolicy, type EnvPolicy } from './core/env-policy.js';
 import { normalizeCredentialsSourceDir } from './services/cli-credential-source.js';
 import { resolveBotmuxConfigDir, resolveBotsConfigFile, type BotsConfigProvenance } from './core/config-dir.js';
@@ -74,6 +77,7 @@ import {
   type AskOptionLayout,
 } from './im/lark/ask-option-layout.js';
 import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
+import { isCodexServiceTier, isCodexServiceTierCliId, type CodexServiceTier } from './services/codex-service-tier.js';
 import {
   normalizeNativeSubagentRuntimePolicy,
   type NativeSubagentRuntimePolicy,
@@ -291,6 +295,9 @@ export interface MessageListenerConfig {
   contentPolicy?: {
     includeKeywords?: string[];
     matchMode?: 'any' | 'all';
+    /** Default false. Resolve supported document titles using only this bot's
+     * application identity when local keyword matching missed. */
+    resolveDocumentTitles?: boolean;
   };
   replyPolicy?: {
     /** `thread` replies under the triggering message; `chat` posts at group top level. */
@@ -1187,6 +1194,7 @@ function normalizeMessageListenerConfig(raw: unknown, botIndex: number, chatId: 
       contentPolicy = {
         includeKeywords,
         ...(contentRaw.matchMode === 'all' ? { matchMode: 'all' as const } : {}),
+        ...(contentRaw.resolveDocumentTitles === true ? { resolveDocumentTitles: true } : {}),
       };
     }
   }
@@ -1390,7 +1398,8 @@ export interface SessionGroupConfig {
   /**
    * What to do with the group when its session is closed:
    * 'keep' (default) — leave the group and registry entry; a later message in
-   * the group resumes the closed session (same-group resume). 'disband' /
+   * the group starts a fresh session (resume explicitly via the close card or
+   * `/resume`). 'disband' /
    * 'archive' are reserved for a follow-up PR and currently behave as 'keep'.
    */
   onClose?: 'keep' | 'disband' | 'archive';
@@ -1424,8 +1433,6 @@ export interface SessionGroupConfig {
    * 'auto' (default) applies it at birth; 'off' keeps Feishu's default avatar.
    */
   avatar?: 'auto' | 'off';
-  /** Reserved (PR3): auto-dispose after N idle days; 0/undefined = off. */
-  idleDays?: number;
 }
 
 export interface BotConfig {
@@ -1442,6 +1449,8 @@ export interface BotConfig {
    * 缺省 / false 保持原有飞书 bot 行为字节不变。
    */
   apiOnly?: boolean;
+  /** Internal, opt-in target policy for dispatch launch IPC. Absent/disabled fails closed. */
+  dispatchLaunchPolicy?: import('./core/dispatch-launch-contract.js').DispatchLaunchPolicyV1;
   /** Final-answer feedback policy. Missing/disabled is intentionally inert. */
   feedback?: FeedbackPolicyInput | FeedbackPolicy;
   oncallGroup?: OncallGroupPolicy;
@@ -1530,6 +1539,8 @@ export interface BotConfig {
   groupDefaultModels?: Record<string, GroupDefaultModels>;
   /** Explicit per-group FIFO for authenticated managed-session IM inputs. Default off; independent of Oncall. */
   groupSerialInput?: Record<string, boolean>;
+  /** Per-group inactivity auto-close; absent entries are disabled. */
+  groupIdleClose?: Record<string, GroupIdleCloseSettings>;
   /** Optional TraeX backend variant. Missing inherits TraeX global config. */
   modelBackendVariant?: 'standard' | 'max';
   /**
@@ -1557,6 +1568,8 @@ export interface BotConfig {
   dshRuntime?: 'official' | 'tui';
   /** Default reasoning effort for newly created sessions on CLIs that support it. */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  /** Codex-only service tier for newly created sessions. Missing inherits Codex. */
+  serviceTier?: CodexServiceTier;
   /** Native TraeCode spawn_agent model/effort override policy. */
   nativeSubagentRuntime?: NativeSubagentRuntimePolicy;
   /**
@@ -1602,6 +1615,7 @@ export interface BotConfig {
    * 都持久化。系统提示部分需 /restart 生效，逐轮信封立即生效。
    */
   replyDelivery?: 'send' | 'transcript';
+  turnResults?: { enabled: boolean };
   /** Skip Botmux prompt/skill/context injection and auto-forward final replies.
    * Existing prompt and skill customizations remain saved. */
   promptInjection?: 'default' | 'none';
@@ -1883,7 +1897,7 @@ export interface BotConfig {
    * Codex flagged in review.
    */
   defaultOncallAutoboundChats?: string[];
-  /** Per-chat reply mode: chat_id → 普通群 @bot 后回复形态。缺省为 chat（保持现状）。 */
+  /** Per-chat reply mode override: chat_id → 普通群 @bot 后回复形态。缺省时继承 regularGroupReplyMode；由 /reply-mode 或 dashboard 群管理写入，`/reply-mode inherit` 清除。 */
   chatReplyModes?: { [chatId: string]: ChatReplyMode };
   /** Per-chat @ 策略：chat_id → 该群的 mention 模式，覆盖 per-bot `regularGroupMentionMode`。由 /mention-mode 写入。 */
   chatMentionModes?: { [chatId: string]: GroupMentionMode };
@@ -1948,6 +1962,8 @@ export interface BotConfig {
    * used 达到 limit 后自动收回**对应 scope** 的授权并删除本记录。纯 talk-only。
    */
   quotaState?: { [quotaKey: string]: { limit: number; used: number } };
+  /** Internal exactly-once receipts for dispatch-launch quota charges. */
+  dispatchLaunchQuotaReceipts?: { [receiptId: string]: { allow: boolean; chargedAt: string } };
   /**
    * scope-aware 授权绝对过期时间。缺少对应记录表示永久授权；旧配置因此保持兼容。
    * key 与 quotaState 相同，便于授权、撤销和到期回收在同一 scope 上原子处理。
@@ -2552,6 +2568,9 @@ export function vcMeetingAgentConfigActive(
 }
 
 export function registerBot(cfg: BotConfig): BotState {
+  if (cfg.turnResults?.enabled !== true || cfg.apiOnly || cfg.readIsolation) {
+    getTurnResultRuntime()?.clearBot(cfg.larkAppId);
+  }
   registerCodexInstanceBot(cfg);
   const parsedStatus = parsedNativeSubagentRuntimeStatus.get(cfg);
   const normalizedRuntime = cfg.cliId === 'traex'
@@ -2890,10 +2909,6 @@ export function findOncallChatForAnyBot(chatId: string): OncallChat | undefined 
     if (entry) return entry;
   }
   return oncallChatCache?.chats.get(chatId);
-}
-
-export function isChatOncallBoundForAnyBot(chatId: string): boolean {
-  return !!findOncallChatForAnyBot(chatId);
 }
 
 // Per-bot brand label, mtime-cached for the disk fallback. Keyed by larkAppId →
@@ -3594,8 +3609,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const substituteMode: SubstituteModeConfig | undefined = normalizeSubstituteMode(entry.substituteMode);
 
     // chatReplyModes：只保留每群显式设置，非法值丢弃。四态 chat｜chat-topic｜
-    // new-topic｜shared 都保留解析；写入路径会删除「与 per-bot 默认相同」的条目
-    // 以保持 bots.json 干净（见 chat-reply-mode-store.setChatReplyMode）。
+    // new-topic｜shared 都保留解析。显式设置即使与当前 per-bot 默认相同也保留为覆盖；
+    // 只有 clearChatReplyMode（`/reply-mode inherit`）才删除键、恢复继承。
     let chatReplyModes: { [chatId: string]: ChatReplyMode } | undefined;
     if (entry.chatReplyModes && typeof entry.chatReplyModes === 'object' && !Array.isArray(entry.chatReplyModes)) {
       const out: { [chatId: string]: ChatReplyMode } = {};
@@ -3678,6 +3693,20 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         out[k] = { limit, used };
       }
       if (Object.keys(out).length > 0) quotaState = out;
+    }
+
+    let dispatchLaunchQuotaReceipts: { [k: string]: { allow: boolean; chargedAt: string } } | undefined;
+    if (entry.dispatchLaunchQuotaReceipts && typeof entry.dispatchLaunchQuotaReceipts === 'object'
+        && !Array.isArray(entry.dispatchLaunchQuotaReceipts)) {
+      const out: { [k: string]: { allow: boolean; chargedAt: string } } = {};
+      for (const [key, value] of Object.entries(entry.dispatchLaunchQuotaReceipts)) {
+        if (!/^quota_[0-9a-f]{32}$/.test(key) || !value || typeof value !== 'object') continue;
+        const allow = (value as any).allow;
+        const chargedAt = (value as any).chargedAt;
+        if (typeof allow !== 'boolean' || typeof chargedAt !== 'string' || !Number.isFinite(Date.parse(chargedAt))) continue;
+        out[key] = { allow, chargedAt };
+      }
+      if (Object.keys(out).length > 0) dispatchLaunchQuotaReceipts = out;
     }
 
     let grantExpiryState: { [k: string]: { expiresAt: number } } | undefined;
@@ -3861,6 +3890,18 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       apiOnly: entry.apiOnly === true || undefined,
       groupCreation: entry.groupCreation === undefined ? undefined : parseGroupCreationDefaults(entry.groupCreation),
       oncallGroup: entry.oncallGroup === undefined ? undefined : normalizeOncallGroupPolicy(entry.oncallGroup),
+      dispatchLaunchPolicy: (() => {
+        if (!entry.dispatchLaunchPolicy || typeof entry.dispatchLaunchPolicy !== 'object') return undefined;
+        try {
+          return normalizeDispatchLaunchPolicy(entry.dispatchLaunchPolicy);
+        } catch (error) {
+          logger.warn(
+            `[bot-registry:${entry.larkAppId}] ignoring invalid dispatchLaunchPolicy: `
+            + `${error instanceof Error ? error.message : String(error)}`,
+          );
+          return undefined;
+        }
+      })(),
       noProgressNotify: entry.noProgressNotify === undefined ? undefined : normalizeNoProgressNotifyPolicy(entry.noProgressNotify),
       feedback: entry.feedback === undefined
         ? undefined
@@ -3892,6 +3933,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       groupDefaultModels: normalizeGroupDefaultModels(entry.groupDefaultModels),
       groupSerialInput: normalizeGroupSerialInput(entry.groupSerialInput),
+      groupIdleClose: normalizeGroupIdleClose(entry.groupIdleClose),
       modelBackendVariant: isBackendVariantCliId(entryCliId)
         && (entry.modelBackendVariant === 'standard' || entry.modelBackendVariant === 'max')
         ? entry.modelBackendVariant
@@ -3911,6 +3953,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
           entry.reasoningEffort,
         )
         ? entry.reasoningEffort : undefined,
+      serviceTier: isCodexServiceTierCliId(entryCliId) && isCodexServiceTier(entry.serviceTier)
+        ? entry.serviceTier
+        : undefined,
       nativeSubagentRuntime: entryCliId === 'traex' && normalizedNativeSubagentRuntime.ok
         ? normalizedNativeSubagentRuntime.value
         : undefined,
@@ -4008,6 +4053,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       messageQuota,
       grantDefaultDurationMs,
       quotaState,
+      dispatchLaunchQuotaReceipts,
       grantExpiryState,
       restrictGrantCommands: entry.restrictGrantCommands === true || undefined,
       // Default is ON, so only explicit false is meaningful/persisted.
@@ -4024,6 +4070,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       envPolicy,
       skills,
       plugins,
+      turnResults: entry.turnResults && typeof entry.turnResults === 'object' && entry.turnResults.enabled === true
+        ? { enabled: true } : undefined,
       lang: isLocale(entry.lang) ? entry.lang : undefined,
       skillInjection: entry.skillInjection === 'global' || entry.skillInjection === 'prompt' || entry.skillInjection === 'off'
         ? entry.skillInjection : undefined,

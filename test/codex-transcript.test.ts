@@ -1724,6 +1724,7 @@ describe('explicit Codex capacity failures', () => {
   it.each([
     { message: 'Selected model is at capacity. Please try a different model.', codex_error_info: 'server_overloaded' },
     { message: 'capacity', codexErrorInfo: 'serverOverloaded' },
+    { code: 'serverOverloaded' },
   ])('recognises the real terminal shape: %j', async error => {
     const { CODEX_CAPACITY_ERROR_CODE, isCodexCapacityError } = await import('../src/services/codex-transcript.js');
     expect(isCodexCapacityError(error)).toBe(true);
@@ -1731,6 +1732,11 @@ describe('explicit Codex capacity failures', () => {
     expect(drainCodexRollout(path, 0).events.at(-1)).toMatchObject({ terminalStatus: 'failed', terminalErrorCode: CODEX_CAPACITY_ERROR_CODE });
     // The taxonomy shared by other CLI readers stays unchanged.
     expect(codexTaskFailureCode(error)).toBe(CODEX_UPSTREAM_ERROR_CODE);
+  });
+
+  it.each([{ code: 'Overloaded: please retry' }, { message: 'Selected model is at capacity, retry later.' }])('keeps non-exact object payloads out of recovery: %j', async error => {
+    const { isCodexCapacityError } = await import('../src/services/codex-transcript.js');
+    expect(isCodexCapacityError(error)).toBe(false);
   });
 
   it.each(['503 Service Unavailable', 'Overloaded: please retry', '429 Too Many Requests', 'gateway timeout'])('does not opt generic %s into capacity recovery', async error => {

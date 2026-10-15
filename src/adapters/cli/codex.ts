@@ -1,15 +1,22 @@
-import { execFile } from 'node:child_process';
 import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { assertNoGlobalBotmuxSkills } from '../../skills/zero-injection.js';
 import { join } from 'node:path';
-import { promisify } from 'node:util';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
-import { parseDebugModelsJson } from './model-catalog-json.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import { wrapBracketedPaste } from './tui-input.js';
+import { capabilitySlugs, type DebugModelCapabilities } from './model-catalog-json.js';
+import { loadCodexServiceTierCatalog } from '../../services/codex-service-tier-catalog.js';
+import type { CliAdapter, PtyHandle, StructuredBridgeSpec } from './types.js';
 import { codexHistoryPath, codexHome, codexSessionsRoot } from '../../services/codex-paths.js';
-import { findCodexRolloutSetByPid } from '../../services/codex-transcript.js';
+import {
+  drainCodexRollout,
+  findCodexRolloutByPid,
+  findCodexRolloutBySessionId,
+  findCodexRolloutSetByPid,
+  findCodexSessionIdByBotmuxSessionId,
+  type CodexDrainState,
+} from '../../services/codex-transcript.js';
 import { refreshCodexTerminalSession } from '../../services/codex-terminal-session.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay, scaleMs } from '../../utils/timing.js';
@@ -200,46 +207,28 @@ async function waitForHistoryAppend(
   return { found: false };
 }
 
-/** Build a JSON-escaped prefix for a cheap raw-line prefilter before parsing
- *  history.jsonl. The final match is exact against the decoded `text` field;
- *  the prefix only avoids JSON-parsing unrelated lines from other sessions. */
-function historyMarker(content: string): string {
-  const prefix = content.slice(0, 40);
-  return JSON.stringify(prefix).slice(1, -1);  // strip surrounding quotes
+function latestCodexSessionForBotmuxSession(botmuxSessionId: string): string | undefined {
+  // Resume must find the mapping however old it is, so no tail cap; the lookup
+  // is a bounded-memory newest-first scan that stops at the first hit, and a
+  // mention without a session_id falls through to an older one.
+  return findCodexSessionIdByBotmuxSessionId(botmuxSessionId, {
+    maxTailBytes: Number.POSITIVE_INFINITY,
+    skipUnmapped: true,
+  });
 }
 
-function latestCodexSessionForBotmuxSession(botmuxSessionId: string): string | undefined {
-  const historyPath = codexHistoryPath();
-  if (!existsSync(historyPath)) return undefined;
-  try {
-    const size = statSync(historyPath).size;
-    const fd = openSync(historyPath, 'r');
-    const buf = Buffer.alloc(size);
-    try {
-      readSync(fd, buf, 0, size, 0);
-    } finally {
-      closeSync(fd);
-    }
-    const marker = JSON.stringify(botmuxSessionId).slice(1, -1);
-    const lines = buf.toString('utf8').trimEnd().split('\n');
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i]!;
-      if (!line.includes(marker)) continue;
-      try {
-        const parsed = JSON.parse(line);
-        if (typeof parsed?.text === 'string' && parsed.text.includes(botmuxSessionId)) {
-          const sid = readCliSessionId(parsed);
-          if (sid) return sid;
-        }
-      } catch {
-        continue;
-      }
-    }
-  } catch {
-    return undefined;
-  }
-  return undefined;
-}
+/** Codex rollout bridge. Spawn attach additionally honours an existing App Server
+ *  share (`split-live`); terminal `/adopt` keeps a dedicated worker branch because
+ *  the thread id comes from a live terminal-session refresh. */
+export const codexBridgeSpec: StructuredBridgeSpec = {
+  drain: (path, offset, ctx) => drainCodexRollout(path, offset, ctx.state as CodexDrainState | undefined),
+  stateCommit: 'drain',
+  locate: {
+    bySessionId: sessionId => findCodexRolloutBySessionId(sessionId),
+    byPid: pid => findCodexRolloutByPid(pid)?.path,
+  },
+  spawn: { sessionId: 'cli', baseline: 'resume-aware', appServerShare: true },
+};
 
 export function createCodexAdapter(pathOverride?: string): CliAdapter {
   // resolvedBin is lazy: setup constructs adapters only to read static
@@ -247,8 +236,21 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
   // is a spawn-time concern.
   const rawBin = pathOverride ?? 'codex';
   let cachedBin: string | undefined;
+  const detectModelCapabilities = async (
+    options?: { env?: NodeJS.ProcessEnv },
+  ): Promise<readonly DebugModelCapabilities[] | null> => {
+    try {
+      return await loadCodexServiceTierCatalog({
+        cliBin: (cachedBin ??= resolveCommand(rawBin)),
+        env: options?.env,
+      });
+    } catch {
+      return null;
+    }
+  };
   return {
     id: 'codex',
+    bridgeSpec: codexBridgeSpec,
     mcpGateway: {
       get configPath(): string { return join(codexHome(), 'config.toml'); },
       format: 'codex-toml',
@@ -278,7 +280,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.codex'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, quietResume, forkSession, workingDir, model, reasoningEffort, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, readIsolation, remoteWsUrl, remoteThreadId, shellSubprocessEnv, promptInjection }) {
+    buildArgs({ sessionId, resume, resumeSessionId, quietResume, forkSession, workingDir, model, reasoningEffort, serviceTier, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, readIsolation, remoteWsUrl, remoteThreadId, shellSubprocessEnv, promptInjection }) {
       if (promptInjection === 'none') {
         assertNoGlobalBotmuxSkills(join(codexHome(), 'skills'));
       }
@@ -393,6 +395,11 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         // low/medium/high/xhigh/max/ultra，故原样透传，不做降级——收敛会静默改变
         // 用户请求的档位。
         baseArgs.push('-c', `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`);
+      }
+      if (serviceTier) {
+        // A root override also covers resume/fork; the splitter below moves it
+        // before the subcommand where launcher-provided -c flags stay active.
+        baseArgs.push('-c', `service_tier=${JSON.stringify(serviceTier)}`);
       }
       // Codex app-server can keep its own cwd at $HOME; -C pins fresh agent roots.
       // NOTE: canonicalization of workingDir for the file sandbox is done ONCE in
@@ -532,7 +539,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
           pty.pasteText(content);
         } else {
           // Non-tmux fallback (raw PTY): wrap the markers ourselves.
-          pty.write('\x1b[200~' + content + '\x1b[201~');
+          pty.write(wrapBracketedPaste(content));
         }
       } catch {
         return { submitted: false };
@@ -635,31 +642,13 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // mis-fire risk is negligible.
     get skillsDir(): string { return join(codexHome(), 'skills'); },
     // 静态列表是 `codex debug models` visibility=list 的快照（2026-08）；
-    // live 探测（detectModels）会补充目录增量，live 不可用时以此兜底。
+    // live 探测成功时只使用 live 目录；live 不可用时以此快照兜底。
     modelChoices: CLI_MODEL_CHOICES['codex'],
-    // Live 模型枚举：`codex debug models`（官方支持，"Render the raw model
-    // catalog as JSON"）输出与 traex 同构的 JSON 目录，复用共享解析。整包可达
-    // 数百 KB，故 maxBuffer 给到 16MB、8s 超时兜底。仅 dashboard 在用户选中
-    // codex 时按需调用，不在 daemon/worker 启动路径上；任何异常（spawn 失败/
-    // 超时/输出非法）一律 fail-soft 返回 null，picker 回退到上面的 modelChoices。
+    // 与保存/启动校验共用真实 binary + env 的能力目录、超时和缓存。
+    detectModelCapabilities,
+
     async detectModels(): Promise<readonly string[] | null> {
-      try {
-        // lazy promisify：顶层 promisify(execFile) 会在部分 mock child_process
-        // 的测试 import 阶段炸（mock 无 execFile 导出）；推迟到调用时，fail-soft
-        // 的 try/catch 兜住（契约：任何异常 → null）。
-        const execFileAsync = promisify(execFile);
-        const { stdout } = await execFileAsync(this.resolvedBin, ['debug', 'models'], {
-          timeout: 8000,
-          maxBuffer: 16 * 1024 * 1024,
-          windowsHide: true,
-        });
-        const models = parseDebugModelsJson(stdout);
-        return models.length > 0 ? models : null;
-      } catch {
-        return null;
-      }
+      return capabilitySlugs(await detectModelCapabilities());
     },
   };
 }
-
-export const create = createCodexAdapter;

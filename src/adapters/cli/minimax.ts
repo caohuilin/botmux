@@ -1,29 +1,15 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { dirname, isAbsolute, join } from 'node:path';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommandReal } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { writeRunnerInput } from './runner-input.js';
 import { runnerArgv0 } from '../../core/self-spawn.js';
+import { resolveRunnerPath } from './runner-path.js';
 import { locateExecutable } from '../../utils/executable.js';
 import type { CliAdapter } from './types.js';
-
-/** MCode owns config.yaml, OAuth, SQLite and native sessions under this root.
- * Match the official CLI's override precedence; bind the entire persistent root. */
-export function minimaxDataDir(env: NodeJS.ProcessEnv = process.env): string {
-  const configured = env.MINIMAX_DATA_DIR?.trim() || env.MAVIS_DATA_DIR?.trim();
-  if (configured) return configured.startsWith('~/') ? join(homedir(), configured.slice(2)) : resolve(configured);
-  return join(homedir(), '.minimax');
-}
-
-function runnerPath(): string {
-  const here = dirname(fileURLToPath(import.meta.url));
-  const sibling = resolve(here, '..', '..', 'minimax-runner.js');
-  if (existsSync(sibling)) return sibling;
-  return resolve(here, '..', '..', '..', 'dist', 'minimax-runner.js');
-}
+import { minimaxDataDir } from '../../services/minimax-paths.js';
+export { minimaxDataDir } from '../../services/minimax-paths.js';
 
 /** npm's bin symlink resolves inside the package. Bind that package, including
  * its chunks/assets/native dependencies, rather than the shared global prefix.
@@ -60,10 +46,10 @@ function prepareNativeDirectories(dataDir: string, officialRoot?: string): void 
 }
 
 /** Keep the stable minimax ID/setup number, replacing mmx completely.
- * A long-lived runner drives native `mcode exec` per turn. Native Session IDs
- * from stream-json are persisted through the runner control channel; every
+ * A long-lived runner drives native `mcode acp` per turn. Native Session IDs
+ * from ACP are persisted through the runner control channel; every
  * later turn uses --session, never the shared/racy --continue shortcut.
- * Headless execution preserves file/shell tools and native skills/plugins. */
+ * ACP preserves file/shell tools and bridges native questions to Lark. */
 export function createMinimaxAdapter(pathOverride?: string): CliAdapter {
   const rawBin = pathOverride ?? 'mcode';
   let cachedBin: string | undefined;
@@ -109,7 +95,7 @@ export function createMinimaxAdapter(pathOverride?: string): CliAdapter {
         if (!node) throw new Error('MiniMax Code npm installation requires node on PATH.');
         nodeBin = realpathSync(node);
       }
-      const args = [runnerArgv0('minimax-runner', runnerPath()), '--mcode-bin', nativeBin(), '--data-dir', dataDir];
+      const args = [runnerArgv0('minimax-runner', resolveRunnerPath('minimax-runner.js', { fallback: 'dist' })), '--mcode-bin', nativeBin(), '--data-dir', dataDir];
       if (nodeBin) args.push('--node-bin', nodeBin);
       if (workingDir) args.push('--cwd', workingDir);
       if (resume && resumeSessionId) args.push('--native-session-id', resumeSessionId);
@@ -144,5 +130,3 @@ export function createMinimaxAdapter(pathOverride?: string): CliAdapter {
     modelChoices: CLI_MODEL_CHOICES.minimax,
   };
 }
-
-export const create = createMinimaxAdapter;

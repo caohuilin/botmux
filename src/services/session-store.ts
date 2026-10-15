@@ -3,6 +3,7 @@ import { join, dirname, basename, resolve, relative, isAbsolute } from 'node:pat
 import { createHash, randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
+import { pidExistsEpermAlive } from '../utils/process-alive.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { DAEMON_HEARTBEAT_STALE_MS } from '../utils/daemon-heartbeat.js';
 import { cleanupMaterializedDashboardImages } from '../core/dashboard-images.js';
@@ -71,6 +72,7 @@ import {
   type PrincipalLaneQueueHandle,
 } from './message-queue.js';
 import { configuredCodexInstanceBot, newSessionCodexInstanceState, legacyCodexInstanceBinding, type SessionCreationSource } from './codex-instance-pool.js';
+import { isCodexServiceTierCliId } from './codex-service-tier.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { resolveCliRuntime, snapshotCliRuntime } from '../adapters/cli/runtime.js';
 import type { HolderReason } from './session-store-copy.js';
@@ -693,15 +695,8 @@ export function hostOccupancyLeaseHeld(
   return !!lease && (lease.leaseUntil > now || processAlive(lease.ownerPid));
 }
 
-function processAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    // EPERM: the process exists but is not ours to signal — still alive.
-    return (err as NodeJS.ErrnoException).code === 'EPERM';
-  }
-}
+// EPERM: the process exists but is not ours to signal — still alive.
+const processAlive = pidExistsEpermAlive;
 
 export type OccupancyClaimResult =
   /** This process holds the lease (claimed, taken over, or renewed). */
@@ -2146,6 +2141,9 @@ function persistRow(session: Session): void {
     if (session.promptInjection === undefined && durable.promptInjection !== undefined) {
       session = { ...session, promptInjection: durable.promptInjection };
     }
+    if (session.serviceTier === undefined && durable.serviceTier !== undefined) {
+      session = { ...session, serviceTier: durable.serviceTier };
+    }
     if (durable.cliInstanceBinding) {
       if (session.cliInstanceBinding && JSON.stringify(session.cliInstanceBinding) !== JSON.stringify(durable.cliInstanceBinding)) {
         throw new Error('Codex instance binding is immutable');
@@ -2196,6 +2194,11 @@ function buildNewSession(
       : source === 'external' ? 'default' : bot?.promptInjection ?? 'default',
     ...initial,
   };
+  if (source !== 'external' && isCodexServiceTierCliId(bot?.cliId)) {
+    session.serviceTier = bot?.serviceTier ?? 'inherit';
+  } else {
+    delete session.serviceTier;
+  }
   if (chatType !== 'p2p' && scope !== 'chat') {
     const models = resolveGroupDefaultModels?.(chatId);
     if (models && Object.keys(models).length) session.groupDefaultModels = structuredClone(models);
@@ -2284,6 +2287,39 @@ export function createSessionWithOwnedMutation<T>(
   sessions.set(created.sessionId, created);
   logger.info(`Created session ${created.sessionId} (thread: ${args.rootMessageId})`);
   return { session: created, result, rows: fresh };
+}
+
+/** Create the target-side dispatch session with its durable owner marker in one row write. */
+export function createDispatchLaunchSession(input: {
+  dispatchId: string;
+  chatId: string;
+  rootMessageId: string;
+  title: string;
+  chatType: 'group' | 'p2p';
+  workingDir: string;
+  larkAppId: string;
+  requestedOverride: import('../core/dispatch-launch-contract.js').DispatchLaunchRequestedOverride;
+  effectiveOverride: import('../core/dispatch-launch-contract.js').DispatchLaunchEffectiveOverride;
+  createdAt: string;
+  expiresAt: string;
+}): Session {
+  loadForWrite();
+  const session: Session = {
+    sessionId: randomUUID(), dispatchLaunchId: input.dispatchId, chatId: input.chatId,
+    chatType: input.chatType, rootMessageId: input.rootMessageId, scope: 'thread',
+    title: input.title, status: 'active', createdAt: new Date().toISOString(),
+    workingDir: input.workingDir, larkAppId: input.larkAppId,
+    reasoningEffort: input.effectiveOverride.reasoningEffort,
+    dispatchLaunchSpec: {
+      version: 1, targetLarkAppId: input.larkAppId, chatId: input.chatId,
+      rootMessageId: input.rootMessageId, requested: input.requestedOverride,
+      effective: input.effectiveOverride, createdAt: input.createdAt, expiresAt: input.expiresAt,
+    },
+  };
+  sessions.set(session.sessionId, session);
+  persistRow(session);
+  logger.info(`Created dispatch launch session ${session.sessionId} (thread: ${input.rootMessageId})`);
+  return session;
 }
 
 export function getSession(sessionId: string): Session | undefined {

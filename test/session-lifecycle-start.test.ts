@@ -213,7 +213,10 @@ import {
   initWorkerPool,
   ensureReadonlyTaskContinuationAttached,
   ensureAutomaticTaskContinuationLease,
+  codexAppCleanInputAcceptedForSession,
   promoteQueuedActivationTail,
+  reserveQueuedActivationTailAdmission,
+  resolveQuarantinedForkPlan,
   restartCounts,
   sendWorkerInput,
   setActiveSessionsRegistry,
@@ -4690,6 +4693,139 @@ describe('Codex App clean-input feature gate', () => {
     });
   });
 
+  // `/cli <id>` 只在会话「尚未启动」时生效：它写一个 pending 的 cliLaunchSnapshot，既不动
+  // session.cliId（此时仍为空）也不起 worker；首次 forkWorker 的 sessionAgentConfig 才把它
+  // resolve 并把 session.cliId 盖成所选 CLI。所以「snapshot 与 session.cliId 不一致」的窗口只有
+  // 一个：pending 且尚未首次 fork。该窗口里的 admission / 记账判定必须按 snapshot 所选 CLI，
+  // 而不是 bot 默认 CLI——否则和 forkWorker（resolve 之后才判定）对同一会话给出相反结论。
+  describe('/cli-selected CLI before the first fork (pending cliLaunchSnapshot)', () => {
+    function snapshotFor(cliId: string, state: 'pending' | 'resolved' = 'pending') {
+      return {
+        version: 1,
+        state,
+        entryId: cliId,
+        cliId,
+        cliRuntime: null,
+        cliPathOverride: null,
+        wrapperCli: null,
+        cliLaunchMode: null,
+        model: null,
+        reasoningEffort: null,
+        modelBackendVariant: null,
+        launchShell: null,
+        startupCommands: [],
+      } as any;
+    }
+
+    /** 尚未首次 fork 的 /cli 会话：snapshot pending、session.cliId 为空。 */
+    function preForkSelectedDs(selected: string): DaemonSession {
+      const ds = makeDs();
+      ds.session.cliLaunchSnapshot = snapshotFor(selected);
+      expect(ds.session.cliId).toBeUndefined();
+      return ds;
+    }
+
+    function withTail(ds: DaemonSession): DaemonSession {
+      ds.session.queuedActivationTail = [{
+        id: 'tail-follow',
+        order: 1,
+        userPrompt: 'FOLLOW',
+        cliInput: { content: 'FOLLOW' },
+        turnId: 'turn-follow',
+      }];
+      ds.session.queuedActivationTailNextOrder = 1;
+      return ds;
+    }
+
+    it('clean-input gate follows the selected Codex App even when the bot default is another CLI', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code', codexAppCleanInput: true }));
+      const ds = preForkSelectedDs('codex-app');
+
+      expect(codexAppCleanInputAcceptedForSession(ds)).toBe(true);
+      // follower 的 arrival-time 冻结决定也走同一判定（reserve → admit 把它固化进 durable tail）。
+      expect(reserveQueuedActivationTailAdmission(ds).codexAppInputAccepted).toBe(true);
+    });
+
+    it('clean-input gate rejects a selected non-Codex-App CLI even when the bot default is codex-app', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
+      const ds = preForkSelectedDs('claude-code');
+
+      expect(codexAppCleanInputAcceptedForSession(ds)).toBe(false);
+      expect(reserveQueuedActivationTailAdmission(ds).codexAppInputAccepted).toBe(false);
+    });
+
+    it('agrees with the post-fork judgement: resolved snapshot (session.cliId stamped) gives the same answer', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code', codexAppCleanInput: true }));
+      const ds = preForkSelectedDs('codex-app');
+      const pending = codexAppCleanInputAcceptedForSession(ds);
+
+      // 首次 fork 之后：snapshot resolved，session.cliId 被盖成所选 CLI。
+      ds.session.cliLaunchSnapshot!.state = 'resolved';
+      ds.session.cliId = 'codex-app';
+      ds.session.agentFrozen = true;
+
+      expect(codexAppCleanInputAcceptedForSession(ds)).toBe(pending);
+      expect(pending).toBe(true);
+    });
+
+    it('promoting a tail head before the first fork opens a Codex App ledger entry for a selected Codex App', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+      const ds = withTail(preForkSelectedDs('codex-app'));
+
+      expect(promoteQueuedActivationTail(ds, { send: false })).toBe(true);
+
+      expect(ds.session.codexAppDispatchLedger).toHaveLength(1);
+      expect(ds.session.codexAppDispatchLedger?.[0]).toEqual(expect.objectContaining({
+        turnId: 'turn-follow',
+        queuedActivationToken: ds.session.queuedActivationToken,
+      }));
+    });
+
+    it('promoting a tail head before the first fork never opens a Codex App ledger entry for a selected non-Codex-App CLI', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+      const ds = withTail(preForkSelectedDs('claude-code'));
+
+      expect(promoteQueuedActivationTail(ds, { send: false })).toBe(true);
+
+      expect(ds.session.queuedActivationPending).toBe(true);
+      expect(ds.session.codexAppDispatchLedger ?? []).toHaveLength(0);
+    });
+
+    it('quarantined-tail recovery decides ledger-vs-resubmit by the selected CLI, in step with the promote it just ran', () => {
+      // 选了 Codex App、bot 默认不是：promote 开了 ledger entry，恢复 fork 就必须走 ledger（空 prompt），
+      // 不能再按 bot 默认 CLI 重提交 queuedActivationInput（同一 turn 会被投递两次）。
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+      const codexAppSelected = withTail(preForkSelectedDs('codex-app'));
+      codexAppSelected.quarantinedActivationTailPromotion = true;
+      const viaLedger = resolveQuarantinedForkPlan(codexAppSelected, '', true);
+      expect(viaLedger.fork).toBe(true);
+      expect(viaLedger.promptInput).toBe('');
+      expect(codexAppSelected.session.codexAppDispatchLedger).toHaveLength(1);
+
+      // 反过来：bot 默认是 codex-app、会话选了别的 CLI：不能走 ledger，必须原样重提交。
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+      const otherSelected = withTail(preForkSelectedDs('claude-code'));
+      otherSelected.quarantinedActivationTailPromotion = true;
+      const resubmit = resolveQuarantinedForkPlan(otherSelected, '', true);
+      expect(resubmit.fork).toBe(true);
+      expect((resubmit.promptInput as { content: string }).content).toBe('FOLLOW');
+      expect(otherSelected.session.codexAppDispatchLedger ?? []).toHaveLength(0);
+    });
+
+    it('sessions without a snapshot keep the session.cliId ?? bot.cliId judgement (unchanged)', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
+      // 没冻结过 cliId：回落 bot。
+      expect(codexAppCleanInputAcceptedForSession(makeDs())).toBe(true);
+      // 已冻结成别的 CLI：不被 bot 后来改成 codex-app 带偏。
+      const frozen = makeDs();
+      frozen.session.cliId = 'claude-code';
+      expect(codexAppCleanInputAcceptedForSession(frozen)).toBe(false);
+      // adopt 会话永不接受 clean sidecar。
+      const adopted = makeDs({ adoptedFrom: { cliId: 'codex-app' } } as any);
+      expect(codexAppCleanInputAcceptedForSession(adopted)).toBe(false);
+    });
+  });
+
   it('promotes the admitted clean sidecar exactly even after the live config gate flips off', () => {
     let cleanInputEnabled = true;
     vi.mocked(getBot).mockImplementation(() => defaultBot({
@@ -7701,7 +7837,8 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
 });
 
 describe('Codex capacity recovery', () => {
-  async function boot() {
+  async function boot(botOverrides: Record<string, unknown> = {}) {
+    vi.mocked(getBot).mockImplementation(() => defaultBot(botOverrides));
     vi.useFakeTimers();
     const sessionReply = vi.fn(async () => 'om_card');
     initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() });
@@ -7756,6 +7893,20 @@ describe('Codex capacity recovery', () => {
     expect(sessionReply.mock.calls[0][1]).toContain('turn-failed');
   });
 
+  it('uses capacity advice for a Codex runtime with a custom display name', async () => {
+    const { ds, worker } = await boot({ wrapperCli: undefined, cliRuntime: {
+      id: 'vendor-codex', displayName: 'VendorCodex', executable: '/opt/vendor-codex', update: { provider: 'none' },
+    } });
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(15_000);
+    fail(ds, worker, continuations(worker)[0].turnId);
+    await vi.advanceTimersByTimeAsync(45_000);
+    fail(ds, worker, continuations(worker)[1].turnId);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.agentAttention?.reason).toContain('VendorCodex');
+    expect(ds.agentAttention?.reason).toMatch(/切换模型|change models/);
+  });
+
   it.each(['codex_auth_failed', 'codex_rate_limited', 'codex_upstream_error', 'codex_connection_failed'])(
     'keeps %s on the normal failure path without automatic continuation', async errorCode => {
       const { ds, worker, sessionReply } = await boot();
@@ -7796,6 +7947,31 @@ describe('Codex capacity recovery', () => {
     expect(ds.session.ordinaryTurnRecovery?.status).toBe('cancelled');
   });
 
+  it('backoff persistence failure still delivers exactly one failure card', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    vi.mocked(sessionStore.updateSession).mockImplementation(s => {
+      if (s.ordinaryTurnRecovery?.status === 'backoff') throw new Error('disk full saving backoff');
+    });
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(sessionReply.mock.calls[0][1]).toContain('turn-failed');
+  });
+
+  it.each(['ctrlc', 'esc'] as const)('%s cancellation lets a late capacity diagnostic use the failure UI', async key => {
+    const { ds, worker, sessionReply } = await boot();
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_capacity', status: 'failed', errorCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(1_000);
+    const { sendWorkerSessionInput } = await import('../src/core/worker-pool.js');
+    expect(sendWorkerSessionInput(ds, { type: 'term_action', key })).toBe(true);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('cancelled');
+    worker.emit('message', { type: 'final_output', turnId: 'om_capacity', lastUuid: 'late-after-stop', content: 'late capacity diagnostic', turnFailed: true, turnFailureCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(sessionReply).toHaveBeenCalledOnce();
+  });
+
   it('a timer persistence failure stops recovery without crashing or executing input', async () => {
     const { ds, worker, sessionReply } = await boot();
     fail(ds, worker);
@@ -7817,6 +7993,20 @@ describe('Codex capacity recovery', () => {
     expect(continuations(worker)).toHaveLength(0);
     await vi.advanceTimersByTimeAsync(1);
     expect(continuations(worker)).toHaveLength(1);
+  });
+
+  it('does not show an old capacity diagnostic after its continuation succeeded', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_capacity', status: 'failed', errorCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(15_000);
+    const turnId = continuations(worker)[0].turnId;
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId, status: 'completed' });
+    await vi.advanceTimersByTimeAsync(0);
+    worker.emit('message', { type: 'final_output', turnId: 'om_capacity', lastUuid: 'very-late-capacity', content: 'obsolete capacity diagnostic', turnFailed: true, turnFailureCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('completed');
+    expect(continuations(worker)).toHaveLength(1);
+    expect(sessionReply).not.toHaveBeenCalled();
   });
 
   it('never continues a capacity failure that belongs to an HTTP waiter', async () => {

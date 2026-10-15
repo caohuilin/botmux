@@ -380,6 +380,42 @@ describe('generic lifecycle hook command', () => {
     expect(await run(null)).toBe(2);
     expect(await runWorkspaceRecycleCommand(['finish', '--operation', 'hook-op', '--operation', 'duplicate'])).toBe(2);
   });
+
+  it('treats a failed event without a prepared operation as nothing to abort', async () => {
+    const f = fixture();
+    vi.stubEnv('SESSION_DATA_DIR', f.dataDir);
+    vi.stubEnv('BOTMUX_SESSION_ID', '');
+    const output = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const eventPath = join(f.root, 'event.json');
+    const run = async (event: unknown) => {
+      writeFileSync(eventPath, JSON.stringify(event));
+      return runWorkspaceRecycleCommand(['hook', '--event-file', eventPath]);
+    };
+    const unprepared = { protocol: WORKSPACE_RECYCLE_PROTOCOL, operationId: 'never-prepared', phase: 'after-reclaim' };
+    expect(await run({ ...unprepared, eventId: 'end-failed', outcome: 'failed' })).toBe(0);
+    expect(JSON.parse(output.mock.calls.at(-1)![0])).toEqual({ ok: true, status: 'not_prepared', operationId: 'never-prepared' });
+    expect(new WorkspaceRecycler({ dataDir: f.dataDir }).hasOperation('never-prepared')).toBe(false);
+    expect(await run({ ...unprepared, eventId: 'end-ok', outcome: 'succeeded' })).toBe(2);
+
+    const prepared = { protocol: WORKSPACE_RECYCLE_PROTOCOL, operationId: 'prepared-op' };
+    expect(await run({ ...prepared, phase: 'before-reclaim', workspacePath: f.workspace })).toBe(0);
+    expect(await run({ ...prepared, phase: 'after-reclaim', eventId: 'end-failed', outcome: 'failed' })).toBe(0);
+    expect(JSON.parse(output.mock.calls.at(-1)![0]).status).toBe('aborted');
+  });
+
+  it('applies the same not_prepared rule to the finish command', async () => {
+    const f = fixture();
+    vi.stubEnv('SESSION_DATA_DIR', f.dataDir);
+    vi.stubEnv('BOTMUX_SESSION_ID', '');
+    const output = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const finish = (eventId: string, outcome: string) =>
+      runWorkspaceRecycleCommand(['finish', '--operation', 'never-prepared', '--event', eventId, '--outcome', outcome]);
+    expect(await finish('end-failed', 'failed')).toBe(0);
+    expect(JSON.parse(output.mock.calls.at(-1)![0])).toEqual({ ok: true, status: 'not_prepared', operationId: 'never-prepared' });
+    expect(await finish('end-ok', 'succeeded')).toBe(2);
+    expect(JSON.parse(output.mock.calls.at(-1)![0]).error).toContain('recycle_operation_not_prepared');
+    expect(f.recycler.hasOperation('never-prepared')).toBe(false);
+  });
 });
 
 describe('durable process readback', () => {

@@ -1129,3 +1129,19 @@ it('Claude restored running can still retry its late provider terminal', () => {
   expect(session.ordinaryTurnRecovery).toMatchObject({ status: 'running', continuationsStarted: 2 });
   disposeOrdinaryTurnRecovery(session);
 });
+
+it.each([
+  { restricted: true, status: 'completed', turnId: 'om_original', code: 'codex_capacity_exceeded', owns: true },
+  { restricted: true, status: 'completed', turnId: 'bmx-recovery-done', code: 'codex_capacity_exceeded', owns: false },
+  { restricted: true, status: 'completed', turnId: 'om_original', code: 'codex_auth_failed', owns: false },
+  { restricted: true, status: 'cancelled', turnId: 'om_original', code: 'codex_capacity_exceeded', owns: false },
+  { restricted: false, status: 'completed', turnId: 'om_original', code: 'provider_server_error', owns: false },
+] as const)('late predecessor notice policy: $restricted / $status / $turnId / $code', ({ restricted, status, turnId, code, owns }) => {
+  const session = { sessionId: `predecessor-${restricted}-${status}-${turnId}-${code}`, ordinaryTurnRecovery: state({ status, currentTurnId: 'bmx-recovery-done', continuationsStarted: 1 }) };
+  attachOrdinaryTurnRecovery(session, {
+    ...(restricted ? { recoverableErrorCodes: ['codex_capacity_exceeded'] } : {}),
+    schedule: vi.fn(), cancel: vi.fn(), persist: vi.fn(), enqueue: vi.fn(() => true), warn: vi.fn(),
+  });
+  expect(ordinaryTurnRecoveryHandlesTerminal(session, { turnId, status: 'failed', errorCode: code })).toBe(owns);
+  disposeOrdinaryTurnRecovery(session);
+});

@@ -37,6 +37,9 @@ import {
 import { normalizeMircliPrompt } from './mir-prompt.js';
 import { resolveMirRunnerTimeoutMs } from './mir-runner-config.js';
 import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
+import { larkToolPromptFromEnv } from './core/lark-tool-binding.js';
+import { errorMessage } from './utils/error-message.js';
+import { createRunnerTerminal, parseRunnerFlags } from './runner-common.js';
 
 interface Args {
   sessionId: string;
@@ -47,6 +50,7 @@ interface Args {
 }
 
 const output = new RunnerControlWriter();
+const { emitMarker, writeLine, prompt } = createRunnerTerminal(output);
 const DEFAULT_QUERY_TIMEOUT = '10m';
 const MARKER_PREFIX = '::botmux-mir:';
 // Backend Claude-harness builtin tools that route to the cloud sandbox; mircli's
@@ -57,34 +61,15 @@ const BUILTIN_SANDBOX_TOOLS = ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep'];
 
 function parseArgs(argv: string[]): Args {
   const out: Args = { sessionId: '' };
-  for (let i = 0; i < argv.length; i++) {
-    const key = argv[i];
-    const val = argv[i + 1];
-    if (key === '--session-id' && val !== undefined) { out.sessionId = val; i++; }
-    else if (key === '--bot-name' && val !== undefined) { out.botName = val; i++; }
-    else if (key === '--bot-open-id' && val !== undefined) { out.botOpenId = val; i++; }
-    else if (key === '--locale' && val !== undefined) { out.locale = val; i++; }
-    else if (key === '--mircli-bin' && val !== undefined) { out.mircliBin = val; i++; }
-  }
+  parseRunnerFlags(argv, out, {
+    '--session-id': 'sessionId',
+    '--bot-name': 'botName',
+    '--bot-open-id': 'botOpenId',
+    '--locale': 'locale',
+    '--mircli-bin': 'mircliBin',
+  });
   if (!out.sessionId) throw new Error('--session-id is required');
   return out;
-}
-
-function emitMarker(kind: string, payload: unknown): void {
-  output.marker(kind, payload);
-}
-
-function writeLine(text = ''): void {
-  output.line(text);
-}
-
-function prompt(): void {
-  output.display('› ');
-}
-
-function errorMessage(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  return String(err);
 }
 
 function logMiramcpAutostart(result: MiramcpAutostartResult): void {
@@ -157,6 +142,8 @@ function runtimeSystemPrompt(): string {
     'Do not say the local MCP bridge is disconnected, that only a cloud sandbox is available, or that the operation is cancelled unless a concrete local tool invocation actually returned that error.',
     'If a local tool invocation fails, report the exact failed operation and error concisely, then stop or ask for the missing input.',
   );
+  const larkPrompt = larkToolPromptFromEnv(args.locale);
+  if (larkPrompt) lines.push(larkPrompt);
   return [
     ...lines,
   ].join('\n');

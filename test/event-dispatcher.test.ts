@@ -49,6 +49,13 @@ vi.mock('node-pty', () => ({
 vi.mock('../src/utils/atomic-write.js', () => ({
   atomicWriteFileSync: (...args: any[]) => mockWriteFileSync(...args),
 }));
+// bots-info.json upserts take a cross-process lock on a real `<path>.lock`
+// file; the fs-mocked `/data` dir here does not exist. This file covers the
+// merge logic only — test/bots-info-store.test.ts covers real concurrency.
+vi.mock('../src/utils/file-lock.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../src/utils/file-lock.js')>(),
+  withFileLockSync: <T>(_target: string, fn: () => T) => fn(),
+}));
 
 // chat.bot_added 观察钩子的发射断言口。真实现是 fire-and-forget 且无 hooks 配置时
 // 为 no-op；mock 掉让断言直接看发射参数（client.ts 的 emitHookEvent 引用也走这个
@@ -63,7 +70,6 @@ const mockGetBot = vi.fn();
 const mockGetAllBots = vi.fn(() => []);
 const mockGetBotOpenId = vi.fn((larkAppId: string) => mockGetBot(larkAppId)?.botOpenId as string | undefined);
 const mockGetOwnerOpenId = vi.fn(() => undefined as string | undefined);
-const mockIsChatOncallBoundForAnyBot = vi.fn<(chatId: string) => boolean>(() => false);
 const mockFindOncallChat = vi.fn<(larkAppId: string, chatId: string) => { chatId: string; workingDir: string } | undefined>(() => undefined);
 vi.mock('../src/bot-registry.js', () => ({
   getBot: (...args: any[]) => mockGetBot(...args),
@@ -71,7 +77,6 @@ vi.mock('../src/bot-registry.js', () => ({
   getBotOpenId: (...args: any[]) => mockGetBotOpenId(...(args as [string])),
   getOwnerOpenId: (...args: any[]) => mockGetOwnerOpenId(...args),
   findOncallChat: (...args: any[]) => mockFindOncallChat(...(args as [string, string])),
-  isChatOncallBoundForAnyBot: (...args: any[]) => mockIsChatOncallBoundForAnyBot(...(args as [string])),
 }));
 
 // 默认与真实实现等价（测试 bot 未开 defaultOncall → 不绑定）；个别用例改写实现来模拟
@@ -190,7 +195,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 // ─── Imports (must be after mocks) ──────────────────────────────────────────
 
 import { __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
-import { __pollMessageListenersOnceForTest, __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, createLarkEventDispatcherRuntime, decideRouting, ensureBotOpenId, isBotMentioned, maybeApplyForceTopicOverride, mentionsAnotherMember, markForwardFollowupsSessionsReady, rawMessageIngressAnchor, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { __pollMessageListenersOnceForTest, __resetMessageListenerPollCursorForTest, __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, createLarkEventDispatcherRuntime, decideRouting, ensureBotOpenId, isBotMentioned, maybeApplyForceTopicOverride, mentionsAnotherMember, markForwardFollowupsSessionsReady, rawMessageIngressAnchor, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
 import {
   VC_BOT_MEETING_ACTIVITY_EVENT,
   VC_BOT_MEETING_ENDED_EVENT,
@@ -1261,6 +1266,90 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime.close();
   });
 
+  it('retries an active canonical route on a replica that does not own that Session', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('topic');
+    const handlers = makeHandlers();
+    handlers.resolveDurableSession = vi.fn(() => undefined);
+    const readPrimarySession = vi.fn(async () => ({
+      sessionId: 'session-owned-elsewhere',
+      chatId: 'chat-primary',
+      rootMessageId: 'msg-primary-root',
+      scope: 'thread' as const,
+      title: 'Remote owner',
+      status: 'active' as const,
+      createdAt: '2026-10-06T00:00:00.000Z',
+      larkAppId: MY_APP_ID,
+    }));
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      { readPrimarySession },
+    );
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA continue' }),
+      messageId: 'msg-primary-followup',
+      rootId: 'msg-primary-root',
+      threadId: 'omt_primary',
+      chatId: 'chat-primary',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await expect(processPrimary(runtime, data, 'msg-primary-followup'))
+      .rejects.toThrow(/active canonical Session is owned by another replica/);
+    expect(readPrimarySession).toHaveBeenCalledWith(`msg-primary-root::${MY_APP_ID}`);
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  it('applies the active canonical owner fence to bot-to-bot follow-ups', async () => {
+    setupBotState({ allowedUsers: [] });
+    mockGetChatMode.mockResolvedValue('topic');
+    const handlers = makeHandlers();
+    handlers.resolveDurableSession = vi.fn(() => undefined);
+    const readPrimarySession = vi.fn(async () => ({
+      sessionId: 'session-owned-elsewhere',
+      chatId: 'chat-primary',
+      rootMessageId: 'msg-primary-root-bot',
+      scope: 'thread' as const,
+      title: 'Remote bot owner',
+      status: 'active' as const,
+      createdAt: '2026-10-06T00:00:00.000Z',
+      larkAppId: MY_APP_ID,
+    }));
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      { readPrimarySession },
+    );
+    const data = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA continue' }),
+      messageId: 'msg-primary-bot-followup',
+      rootId: 'msg-primary-root-bot',
+      threadId: 'omt_primary_bot',
+      chatId: 'chat-primary',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await expect(processPrimary(runtime, data, 'msg-primary-bot-followup'))
+      .rejects.toThrow(/active canonical Session is owned by another replica/);
+    expect(readPrimarySession).toHaveBeenCalledWith(`msg-primary-root-bot::${MY_APP_ID}`);
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
   it.each(['never', 'ambient'] as const)(
     'dispatches a %s topic seed immediately when the durable primary wait is disabled',
     async mentionMode => {
@@ -1446,6 +1535,49 @@ describe('Lark event dispatcher — durable primary processor', () => {
           type: 'warning',
           content: expect.stringContaining('多副本持久模式'),
         },
+      });
+      expect(handlers.handleCardAction).not.toHaveBeenCalled();
+      expect(enqueuePrimary).not.toHaveBeenCalled();
+      runtime.close();
+    },
+  );
+
+  it.each(['close', 'resume'] as const)(
+    'persists a stable %s interaction before ACK when a control consumer is wired',
+    async action => {
+      setupBotState({ allowedUsers: [USER_OPEN_ID] });
+      const handlers = makeHandlers();
+      const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+      const enqueuePrimaryControl = vi.fn(async () => ({ kind: 'inserted' as const }));
+      const runtime = createLarkEventDispatcherRuntime(
+        MY_APP_ID,
+        'secret',
+        handlers,
+        'feishu',
+        undefined,
+        { enqueuePrimary, enqueuePrimaryControl, authorizePrimaryControl: () => true },
+      );
+      runtime.connect();
+
+      const data = {
+        event_id: `evt_${action}_1`,
+        action: {
+          value: {
+            action,
+            session_id: 'session-primary',
+            root_id: 'om_primary_root',
+          },
+        },
+        operator: { open_id: USER_OPEN_ID },
+        context: { open_message_id: 'om_primary_lifecycle' },
+      };
+      const result = await capturedHandlers['card.action.trigger'](data);
+
+      expect(result).toMatchObject({ toast: { type: 'info' } });
+      expect(enqueuePrimaryControl).toHaveBeenCalledWith({
+        eventId: `card.action.trigger:${MY_APP_ID}:evt_${action}_1`,
+        partitionKey: `lark-session-control:${MY_APP_ID}:session-primary`,
+        data,
       });
       expect(handlers.handleCardAction).not.toHaveBeenCalled();
       expect(enqueuePrimary).not.toHaveBeenCalled();
@@ -2643,7 +2775,6 @@ describe('im.message.receive_v1 — message_id dedupe (re-push protection)', () 
     mockGetCachedChatMode.mockReset().mockReturnValue(undefined);
     setupBotState();
     handlers = makeHandlers();
-    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
     mockFindOncallChat.mockReturnValue(undefined);
     startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
   });
@@ -2730,6 +2861,7 @@ describe('message listener polling backfill', () => {
     __resetAnchorQueues();
     __resetEventClaimsForTest();
     _resetGrantPending();
+    __resetMessageListenerPollCursorForTest();
     mockListChatMessagesUntil.mockReset().mockResolvedValue([]);
     setupBotState({
       allowedUsers: [USER_OPEN_ID],
@@ -2768,8 +2900,12 @@ describe('message listener polling backfill', () => {
 
     expect(mockListChatMessagesUntil).toHaveBeenCalledWith(MY_APP_ID, 'chat_listener', expect.objectContaining({
       pageSize: expect.any(Number),
+      timeoutMs: 15_000,
+      signal: expect.any(AbortSignal),
       stopAfter: expect.any(Function),
     }));
+    // 正常完成的请求不会被事后 abort。
+    expect(mockListChatMessagesUntil.mock.calls[0][2].signal.aborted).toBe(false);
     expect(handlers.handleNewTopic).toHaveBeenCalledWith(
       expect.objectContaining({ message: expect.objectContaining({ message_id: 'msg-polled-argos' }) }),
       expect.objectContaining({
@@ -2941,6 +3077,265 @@ describe('message listener polling backfill', () => {
     expect(mockResolveCurrentChatBotOpenIds).not.toHaveBeenCalled();
   });
 
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>(r => { resolve = r; });
+    return { promise, resolve };
+  }
+
+  function polledArgosCard(messageId: string) {
+    return makeHistoryMessage({
+      senderAppId: OTHER_BOT_APP_ID,
+      senderType: 'app',
+      messageType: 'interactive',
+      messageId,
+      chatId: 'chat_listener',
+      content: JSON.stringify({ title: 'Argos平台报警', elements: [[{ tag: 'text', text: `告警 ${messageId}` }]] }),
+      createTime: String(Date.now()),
+    });
+  }
+
+  it('times out a hung chat-history request, releases the poll lock and resumes on the next tick', async () => {
+    vi.useFakeTimers();
+    try {
+      const hung = deferred<any[]>();
+      let hungSignal: AbortSignal | undefined;
+      mockListChatMessagesUntil
+        .mockImplementationOnce(async (_app: string, _chat: string, options: any) => {
+          hungSignal = options.signal;
+          return hung.promise; // 底层请求无视 signal、永不返回
+        })
+        .mockResolvedValueOnce([polledArgosCard('msg-after-recovery')]);
+      startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+      // t=2s 初始轮询发出请求并卡住。
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(mockListChatMessagesUntil).toHaveBeenCalledTimes(1);
+      expect(hungSignal?.aborted).toBe(false);
+
+      // t=17s 单群截止时间到：请求被 abort，本轮结束、锁释放。
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(hungSignal?.aborted).toBe(true);
+
+      // 卡住的请求事后才返回：不得用陈旧结果分发。
+      hung.resolve([polledArgosCard('msg-stale-after-abort')]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+
+      // t=30s 下一拍：锁已释放，轮询恢复并正常分发。
+      await vi.advanceTimersByTimeAsync(13_000);
+      expect(mockListChatMessagesUntil).toHaveBeenCalledTimes(2);
+      expect(handlers.handleNewTopic).toHaveBeenCalledTimes(1);
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(
+        expect.objectContaining({ message: expect.objectContaining({ message_id: 'msg-after-recovery' }) }),
+        expect.anything(),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('aborts a whole poll run stuck outside the request deadline and never dispatches its stale results', async () => {
+    vi.useFakeTimers();
+    try {
+      setupBotState({
+        allowedUsers: [USER_OPEN_ID],
+        messageListeners: {
+          chat_listener: {
+            enabled: true,
+            prompt: '只处理 Argos 告警',
+            senderPolicy: {
+              mode: 'include_only',
+              includeSenderOpenIds: [OTHER_BOT_OPEN_ID],
+              includeSenderTypes: ['bot'],
+            },
+            messagePolicy: { includeMsgTypes: ['interactive'], scope: 'top_level' },
+            replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+          },
+        },
+      });
+      handlers = makeHandlers();
+      mockGetAllBots.mockReturnValue([
+        { config: { larkAppId: MY_APP_ID } },
+        { config: { larkAppId: OTHER_BOT_APP_ID } },
+      ] as any);
+      const resolution = { ok: true, mappings: [{ larkAppId: OTHER_BOT_APP_ID, subjectOpenId: OTHER_BOT_OPEN_ID }] };
+      const hungResolver = deferred<any>();
+      // 成员解析卡住——它不在单请求截止时间覆盖范围内，只能靠整轮看门狗兜底。
+      mockResolveCurrentChatBotOpenIds
+        .mockImplementationOnce(() => hungResolver.promise)
+        .mockResolvedValue(resolution as any);
+      mockListChatMessagesUntil.mockResolvedValue([polledArgosCard('msg-run-watchdog')]);
+      startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+      // t=2s 初始轮询卡在成员解析；之后每拍都因锁被跳过。
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(mockResolveCurrentChatBotOpenIds).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(90_000);
+      expect(mockListChatMessagesUntil).toHaveBeenCalledTimes(1);
+
+      // t=122s 看门狗触发：本轮被放弃，锁释放。卡住的解析事后返回也不得分发。
+      await vi.advanceTimersByTimeAsync(30_000);
+      hungResolver.resolve(resolution);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+
+      // t=150s 下一拍恢复，同一条消息只分发一次。
+      await vi.advanceTimersByTimeAsync(28_000);
+      expect(mockListChatMessagesUntil).toHaveBeenCalledTimes(2);
+      expect(handlers.handleNewTopic).toHaveBeenCalledTimes(1);
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(
+        expect.objectContaining({ message: expect.objectContaining({ message_id: 'msg-run-watchdog' }) }),
+        expect.anything(),
+      );
+    } finally {
+      mockGetAllBots.mockReturnValue([]);
+      vi.useRealTimers();
+    }
+  });
+
+  it('skips the poll when the bot open_id probe times out, so its own messages never self-trigger', async () => {
+    vi.useFakeTimers();
+    // 探测请求在用例内永不返回；收尾时再让它失败，免得共享的 in-flight 探测泄漏到后续用例。
+    let failProbe: (err: Error) => void = () => {};
+    const fetchMock = vi.fn(() => new Promise<Response>((_, reject) => { failProbe = reject; }));
+    vi.stubGlobal('fetch', fetchMock as any);
+    try {
+      setupBotState({
+        botOpenId: undefined,
+        allowedUsers: [USER_OPEN_ID],
+        messageListeners: {
+          chat_listener: {
+            enabled: true,
+            prompt: '监听所有 bot 消息',
+            senderPolicy: { mode: 'all_except_excluded', includeSenderTypes: ['bot'] },
+            messagePolicy: { includeMsgTypes: ['interactive'], scope: 'top_level' },
+            replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+          },
+        },
+      });
+      // 历史消息里 bot 自己的消息带 open_bot_id（=自己的 ou_），身份未知时无法自排除。
+      const own = makeHistoryMessage({
+        senderAppId: MY_APP_ID,
+        senderOpenBotId: MY_OPEN_ID,
+        senderType: 'app',
+        messageType: 'interactive',
+        messageId: 'msg-own-card',
+        chatId: 'chat_listener',
+        content: JSON.stringify({ title: '自己发的卡片', elements: [[{ tag: 'text', text: '不应自触发' }]] }),
+        createTime: String(Date.now()),
+      });
+      mockListChatMessagesUntil.mockResolvedValue([own]);
+
+      const run = __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+      await vi.advanceTimersByTimeAsync(10_000);
+      await run;
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(fetchMock).toHaveBeenCalled();
+      expect(mockListChatMessagesUntil).not.toHaveBeenCalled();
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    } finally {
+      failProbe(new Error('test teardown'));
+      await vi.advanceTimersByTimeAsync(0);
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
+
+  function setupSiblingListenerChats(chatIds: string[]) {
+    const listener = {
+      enabled: true,
+      prompt: '只处理 Argos 告警',
+      senderPolicy: {
+        mode: 'include_only' as const,
+        includeSenderOpenIds: [OTHER_BOT_OPEN_ID],
+        includeSenderTypes: ['bot' as const],
+      },
+      messagePolicy: { includeMsgTypes: ['interactive'], scope: 'top_level' as const },
+      replyPolicy: { mode: 'thread' as const, sessionMode: 'per_message' as const },
+    };
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      messageListeners: Object.fromEntries(chatIds.map(id => [id, { ...listener }])),
+    });
+    handlers = makeHandlers();
+    mockGetAllBots.mockReturnValue([
+      { config: { larkAppId: MY_APP_ID } },
+      { config: { larkAppId: OTHER_BOT_APP_ID } },
+    ] as any);
+    mockListChatMessagesUntil.mockImplementation(async (_app: string, chatId: string) => [
+      makeHistoryMessage({
+        senderAppId: OTHER_BOT_APP_ID,
+        senderType: 'app',
+        messageType: 'interactive',
+        messageId: `msg-${chatId}`,
+        chatId,
+        content: JSON.stringify({ title: 'Argos平台报警', elements: [[{ tag: 'text', text: `告警 ${chatId}` }]] }),
+        createTime: String(Date.now()),
+      }),
+    ]);
+  }
+
+  function dispatchedMessageIds(): string[] {
+    return handlers.handleNewTopic.mock.calls.map((call: any[]) => call[0]?.message?.message_id);
+  }
+
+  const siblingResolution = { ok: true, mappings: [{ larkAppId: OTHER_BOT_APP_ID, subjectOpenId: OTHER_BOT_OPEN_ID }] };
+
+  it('resumes from the unfinished chat after a watchdog abort so later chats are eventually polled', async () => {
+    vi.useFakeTimers();
+    try {
+      setupSiblingListenerChats(['chat_a', 'chat_b', 'chat_c']);
+      // 每个群的成员解析都要 50s：一整轮 150s 稳定超过 120s 看门狗。
+      mockResolveCurrentChatBotOpenIds.mockImplementation(
+        () => new Promise(resolve => setTimeout(() => resolve(siblingResolution as any), 50_000)),
+      );
+      startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+      await vi.advanceTimersByTimeAsync(400_000);
+
+      expect(dispatchedMessageIds()).toEqual(expect.arrayContaining(['msg-chat_a', 'msg-chat_b', 'msg-chat_c']));
+    } finally {
+      mockGetAllBots.mockReturnValue([]);
+      vi.useRealTimers();
+    }
+  });
+
+  it('skips past a chat that stalls the whole run on its own so the remaining chats still get polled', async () => {
+    vi.useFakeTimers();
+    try {
+      setupSiblingListenerChats(['chat_stuck', 'chat_ok']);
+      mockResolveCurrentChatBotOpenIds.mockImplementation((_recv: string, chatId: string) => (
+        chatId === 'chat_stuck'
+          ? new Promise(() => { /* 永久卡死 */ })
+          : Promise.resolve(siblingResolution as any)
+      ));
+      startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+      await vi.advanceTimersByTimeAsync(200_000);
+
+      expect(dispatchedMessageIds()).toContain('msg-chat_ok');
+      expect(dispatchedMessageIds()).not.toContain('msg-chat_stuck');
+    } finally {
+      mockGetAllBots.mockReturnValue([]);
+      vi.useRealTimers();
+    }
+  });
+
+  it('stops a poll run without dispatching once its signal is aborted', async () => {
+    const controller = new AbortController();
+    mockListChatMessagesUntil.mockImplementationOnce(async () => {
+      controller.abort(new Error('run deadline'));
+      return [polledArgosCard('msg-aborted-run')];
+    });
+
+    await __pollMessageListenersOnceForTest(MY_APP_ID, handlers, Date.now(), controller.signal);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
   it('starts polling after a listener is enabled at runtime', async () => {
     vi.useFakeTimers();
     const state = setupBotState({
@@ -2989,7 +3384,6 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     mockRecordObservedBots.mockClear();
     setupBotState();
     handlers = makeHandlers();
-    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
     mockFindOncallChat.mockReturnValue(undefined);
     startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
   });
@@ -4039,7 +4433,6 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
   it('lets a bot use /t to seed a topic in an oncall chat (override reachable past the oncall exemption)', async () => {
     // oncall 短路整段 gate（!findOncallChat），override 仍须落在它后面照常翻 thread。
     mockGetChatMode.mockResolvedValueOnce('group');
-    mockIsChatOncallBoundForAnyBot.mockReturnValue(true);
     mockFindOncallChat.mockReturnValue({ chatId: 'chat-001', workingDir: '/repo' });
     mockReadFileSync.mockReturnValue('{}');  // empty cross-ref → unknown peer，靠 oncall 放行
     const event = makeBotMessageEvent({
@@ -4154,7 +4547,6 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     // 注意 /introduce 写的是 observed-bots-store（发现/能 @ 到对方），跟这道接收侧
     // cross-ref vetting 是两套独立存储，不是这里放行的前提。
     mockGetChatMode.mockResolvedValueOnce('group');
-    mockIsChatOncallBoundForAnyBot.mockReturnValue(true);
     mockFindOncallChat.mockReturnValue({ chatId: 'chat-001', workingDir: '/repo' });
     mockReadFileSync.mockReturnValue('{}');  // empty cross-ref → unknown peer
     const event = makeBotMessageEvent({
@@ -4184,7 +4576,6 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     // (787-799) 之后。所以即便 chat 是 oncall-bound，本 bot 自己发的非 /close
     // 消息仍在 self 分支被 drop，不会因为 oncall 而被路由。
     // （self 非 /close 在 decideRouting 之前就 return，故无需 stub getChatMode。）
-    mockIsChatOncallBoundForAnyBot.mockReturnValue(true);
     mockFindOncallChat.mockReturnValue({ chatId: 'chat-001', workingDir: '/repo' });
     const event = makeBotMessageEvent({
       senderOpenId: MY_OPEN_ID,  // own message
@@ -4203,7 +4594,6 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
   it('still processes self /close even when chat is oncall-bound', async () => {
     // 镜像上一条：oncall 不应改变 self /close 的既有行为 —— 精确 /close 仍进入
     // handleThreadReply 走关闭流程。
-    mockIsChatOncallBoundForAnyBot.mockReturnValue(true);
     mockFindOncallChat.mockReturnValue({ chatId: 'chat-001', workingDir: '/repo' });
     const event = makeBotMessageEvent({
       senderOpenId: MY_OPEN_ID,  // own message
@@ -4227,7 +4617,6 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     // the same chat. Cross-bot oncall discovery may still report the chat as
     // bound somewhere, but that must not open talk access for this receiver.
     mockGetChatMode.mockResolvedValueOnce('topic');
-    mockIsChatOncallBoundForAnyBot.mockReturnValue(true);
     mockFindOncallChat.mockReturnValue(undefined);
     mockGetBot.mockReturnValue({
       config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedUsers: ['ou_allowed_sibling'] },
@@ -4255,7 +4644,6 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
   it('allows ordinary talk for any sender when the current chat is in allowedChatGroups', () => {
     // chatId-based: membership is implicit (you can only post in chats you belong to),
     // so any sender posting in a talk-open chat passes — no member snapshot needed.
-    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
     mockGetBot.mockReturnValue({
       config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedChatGroups: ['oc_team'] },
       botOpenId: MY_OPEN_ID,
@@ -4268,7 +4656,6 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
 
   it('denies talk in a chat that is not listed in allowedChatGroups when an allowlist exists', () => {
     // chat-scoped: a talk-open chat does NOT leak permission into other chats / DMs.
-    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
     mockGetBot.mockReturnValue({
       config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedChatGroups: ['oc_team'] },
       botOpenId: MY_OPEN_ID,
@@ -4297,7 +4684,6 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     // scoped open_id is never in that list, so a valid @mention fell through
     // to "⚠️ 无操作权限" instead of routing to the target bot.
     mockGetChatMode.mockResolvedValueOnce('group');
-    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
     mockReadFileSync.mockReturnValue(JSON.stringify({ 'BotB': OTHER_BOT_OPEN_ID }));
     mockGetBot.mockReturnValue({
       config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedUsers: ['ou_allowed_human_only'] },
@@ -6978,7 +7364,6 @@ describe('im.message.receive_v1 — per-chat mention mode (chatMentionModes over
 
 describe('globalGrants — global talk-only authorization (canTalk / canOperate)', () => {
   beforeEach(() => {
-    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
     mockReadFileSync.mockReturnValue('{}');  // empty peer cross-ref
   });
 
@@ -7015,7 +7400,6 @@ describe('globalGrants — global talk-only authorization (canTalk / canOperate)
 
 describe('managed Agent clone owner boundary', () => {
   beforeEach(() => {
-    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
     mockReadFileSync.mockReturnValue('{}');
   });
 
@@ -7140,7 +7524,6 @@ describe('managed Agent clone owner boundary', () => {
 
 describe('configured-but-unresolved allowlist stays fail-closed (not fail-open)', () => {
   beforeEach(() => {
-    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
     mockReadFileSync.mockReturnValue('{}');  // empty peer cross-ref
   });
 
@@ -7195,7 +7578,6 @@ describe('im.message.receive_v1 — stale chat-scope detection (group → topic 
     __resetEventClaimsForTest();
     setupBotState();
     handlers = makeHandlers();
-    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
     mockListChatBotMembers.mockResolvedValue([{ openId: MY_OPEN_ID, name: 'BotA' }]);
     startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
   });
@@ -7301,7 +7683,6 @@ describe('im.message.receive_v1 — stale topic detection (topic → group conve
     __resetEventClaimsForTest();
     setupBotState();
     handlers = makeHandlers();
-    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
     mockListChatBotMembers.mockResolvedValue([{ openId: MY_OPEN_ID, name: 'BotA' }]);
     startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
   });
@@ -8511,7 +8892,6 @@ describe('im.message.receive_v1 — /introduce command', () => {
     __resetEventClaimsForTest();
     setupBotState();
     handlers = makeHandlers();
-    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
     mockRecordObservedBots.mockReset();
     mockReplyMessage.mockReset().mockResolvedValue('ack-msg-id');
     mockIsHumanOpenId.mockReset().mockResolvedValue(false);
@@ -8903,6 +9283,30 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(afterAck).toHaveBeenCalledTimes(1);
     expect(mockUpdateMessage).not.toHaveBeenCalled();
+  });
+
+  it('runs a completion continuation only after returning the empty ACK', async () => {
+    const afterAck = vi.fn();
+    handlers.handleCardAction.mockResolvedValue({
+      deferredCard: { type: 'raw', data: { type: 'proposal-accepted' } },
+      afterAck,
+    });
+
+    const result = await capturedHandlers['card.action.trigger']({
+      action: { value: {
+        action: 'completion_proposal_decide',
+        proposal_id: 'cp_0123456789abcdef0123456789abcdef',
+        nonce: 'n'.repeat(64),
+        decision: 'accept',
+      } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_completion_proposal' },
+    });
+
+    expect(result).toEqual({});
+    expect(afterAck).not.toHaveBeenCalled();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(afterAck).toHaveBeenCalledTimes(1);
   });
 
   it('surfaces deferred patch failure as an empty ACK without returning an invalid card response', async () => {
@@ -9310,6 +9714,31 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     await Promise.all([firstP, secondP]);
   });
 
+  it('does not collapse accept and dismiss for one completion proposal without event_id', async () => {
+    let release1!: () => void;
+    let release2!: () => void;
+    handlers.handleCardAction
+      .mockReturnValueOnce(new Promise(resolve => { release1 = () => resolve({ type: 'accepted' }); }) as any)
+      .mockReturnValueOnce(new Promise(resolve => { release2 = () => resolve({ type: 'dismissed' }); }) as any);
+    const event = (decision: 'accept' | 'dismiss') => ({
+      action: { value: {
+        action: 'completion_proposal_decide',
+        proposal_id: 'cp_0123456789abcdef0123456789abcdef',
+        nonce: 'n'.repeat(64),
+        decision,
+      } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_completion_proposal' },
+    });
+
+    const accept = capturedHandlers['card.action.trigger'](event('accept'));
+    const dismiss = capturedHandlers['card.action.trigger'](event('dismiss'));
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    release1();
+    release2();
+    await Promise.all([accept, dismiss]);
+  });
+
   // Settings counterpart guard — dash_settings_toggle on different fields.
   // Sanity check that the existing settings dedupe key still works.
   it('concurrent `dash_settings_toggle` clicks on DIFFERENT fields must NOT dedupe', async () => {
@@ -9636,7 +10065,6 @@ describe('im.message.receive_v1 — ack-safe duplicate delivery', () => {
     mockRecordObservedBots.mockClear();
     setupBotState({ allowedUsers: [USER_OPEN_ID] });
     handlers = makeHandlers();
-    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
     mockFindOncallChat.mockReturnValue(undefined);
     mockGetChatMode.mockResolvedValue('group');
     startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
@@ -10041,7 +10469,6 @@ describe('im.message.receive_v1 — botOpenId startup race', () => {
     mockRecordObservedBots.mockClear();
     setupBotState();
     handlers = makeHandlers();
-    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
     startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
   });
 

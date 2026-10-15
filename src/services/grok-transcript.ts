@@ -27,20 +27,19 @@
  * HOL-block-drop still applies if a steer-like merge ever appears.
  */
 import {
-  existsSync, statSync, openSync, readSync, closeSync, readdirSync, readFileSync, readlinkSync,
+  existsSync, statSync, openSync, readSync, closeSync, readdirSync, readFileSync,
 } from 'node:fs';
-import { execSync } from 'node:child_process';
-import { platform } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { CodexBridgeEvent, CodexDrainResult } from './codex-transcript.js';
+import { beginJsonlDrain, iterateJsonlLines } from './jsonl-cursor.js';
 import {
   encodeGrokCwd, grokSessionsRoot, grokUpdatesPath, grokSummaryPath,
   resolveGrokCwdBucketDir,
 } from './grok-paths.js';
 import { isBotmuxInjectedPrompt } from './resumable-session-discovery.js';
+import { listProcessOpenFiles } from '../utils/process-open-files.js';
 import type { ResumableSession } from '../adapters/cli/types.js';
 
-const IS_LINUX = platform() === 'linux';
 const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const GROK_SESSIONS_ANCHOR = '/.grok/sessions/';
 const TITLE_MAX = 80;
@@ -182,37 +181,14 @@ export function findGrokSessionByPid(
     }
     return best?.hit;
   };
-  if (IS_LINUX) {
-    const fdDir = `/proc/${pid}/fd`;
-    if (existsSync(fdDir)) {
-      let entries: string[];
-      try { entries = readdirSync(fdDir); } catch { return undefined; }
-      for (const fd of entries) {
-        let target: string;
-        try { target = readlinkSync(join(fdDir, fd)); } catch { continue; }
-        if (target.endsWith(' (deleted)')) continue;
-        const hit = matchGrokSessionPath(target);
-        if (hit && !hits.some((seen) => seen.sessionId === hit.sessionId)) hits.push(hit);
-      }
-      // During `/new` Grok can briefly retain descriptors for both session
-      // directories. Prefer the stream most recently appended instead of
-      // depending on /proc fd enumeration order (which could rotate the
-      // worker bridge backwards to the retired session).
-      return newestHit();
-    }
-  }
-  let out: string;
-  try {
-    out = execSync(`lsof -p ${pid} -Fn`, {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-  } catch {
-    return undefined;
-  }
-  for (const line of out.split('\n')) {
-    if (!line.startsWith('n/')) continue;
-    const hit = matchGrokSessionPath(line.slice(1));
+  // During `/new` Grok can briefly retain descriptors for both session
+  // directories. Prefer the stream most recently appended instead of
+  // depending on fd enumeration order (which could rotate the worker bridge
+  // backwards to the retired session).
+  const targets = listProcessOpenFiles(pid, { skipDeleted: true });
+  if (!targets) return undefined;
+  for (const target of targets) {
+    const hit = matchGrokSessionPath(target);
     if (hit && !hits.some((seen) => seen.sessionId === hit.sessionId)) hits.push(hit);
   }
   return newestHit();
@@ -300,22 +276,10 @@ function grokTerminalOutcome(
  * dedups by uuid).
  */
 export function drainGrokUpdates(path: string, fromOffset: number): GrokDrainResult {
-  if (!existsSync(path)) return { events: [], newOffset: 0, pendingTail: '' };
-  let size: number;
-  try { size = statSync(path).size; } catch { return { events: [], newOffset: fromOffset, pendingTail: '' }; }
-  let start = fromOffset;
-  if (size < start) start = 0;
-  if (size === start) return { events: [], newOffset: start, pendingTail: '' };
-
-  const len = size - start;
-  const buf = Buffer.alloc(len);
-  const fd = openSync(path, 'r');
-  try { readSync(fd, buf, 0, len, start); } finally { closeSync(fd); }
-
-  const text = buf.toString('utf8');
-  const lastNl = text.lastIndexOf('\n');
-  const completeText = lastNl >= 0 ? text.slice(0, lastNl + 1) : '';
-  const pendingTail = lastNl >= 0 ? text.slice(lastNl + 1) : text;
+  const step = beginJsonlDrain(path, fromOffset);
+  if (step.kind !== 'read') return { events: [], newOffset: step.newOffset, pendingTail: '' };
+  const start = step.start;
+  const { completeText, pendingTail } = step.window;
 
   // Pure partial-line window (writer mid-flush, no '\n' yet): never advance.
   // ''.split('\n') yields [''] — treating that as a bare newline would push
@@ -329,29 +293,12 @@ export function drainGrokUpdates(path: string, fromOffset: number): GrokDrainRes
   let agentParts: string[] = [];
   let openTurnStartOffset: number | null = null;
   let openTurnSessionId: string | undefined;
-  let cursor = start;
-  let lastFullyConsumedOffset = start;
 
-  for (const line of completeText.split('\n')) {
-    if (line.length === 0) {
-      cursor += 1; // bare \n
-      lastFullyConsumedOffset = cursor;
-      continue;
-    }
-    const lineStart = cursor;
-    const lineBytes = Buffer.byteLength(line, 'utf8') + 1; // + \n
-    cursor += lineBytes;
-
+  for (const { line, lineStart } of iterateJsonlLines(completeText, start)) {
     let obj: any;
-    try { obj = JSON.parse(line); } catch {
-      lastFullyConsumedOffset = cursor;
-      continue;
-    }
+    try { obj = JSON.parse(line); } catch { continue; }
     const update = obj?.params?.update ?? obj?.update;
-    if (!update || typeof update !== 'object') {
-      lastFullyConsumedOffset = cursor;
-      continue;
-    }
+    if (!update || typeof update !== 'object') continue;
     const su = update.sessionUpdate as string | undefined;
     const sessionId =
       (typeof obj?.params?.sessionId === 'string' && obj.params.sessionId)
@@ -375,7 +322,6 @@ export function drainGrokUpdates(path: string, fromOffset: number): GrokDrainRes
           sourceSessionId: sessionId,
         });
       }
-      lastFullyConsumedOffset = cursor;
       continue;
     }
 
@@ -386,7 +332,7 @@ export function drainGrokUpdates(path: string, fromOffset: number): GrokDrainRes
         if (sessionId) openTurnSessionId = sessionId;
         agentParts.push(chunk);
       }
-      // Do not advance lastFullyConsumedOffset past open group — handled at end.
+      // The offset must not move past an open group — handled at the end.
       continue;
     }
 
@@ -417,7 +363,6 @@ export function drainGrokUpdates(path: string, fromOffset: number): GrokDrainRes
         ...outcome,
       });
       openTurnSessionId = undefined;
-      lastFullyConsumedOffset = cursor;
       continue;
     }
 
@@ -430,14 +375,13 @@ export function drainGrokUpdates(path: string, fromOffset: number): GrokDrainRes
       openTurnStartOffset = null;
       openTurnSessionId = undefined;
     }
-    lastFullyConsumedOffset = cursor;
   }
 
   // Mid-group at EOF (final reply still streaming): rewind so agent chunks
   // are re-read next tick.
   const newOffset = openTurnStartOffset !== null
     ? openTurnStartOffset
-    : (completeText ? start + Buffer.byteLength(completeText, 'utf8') : lastFullyConsumedOffset);
+    : step.window.newOffset;
 
   return { events, newOffset, pendingTail };
 }

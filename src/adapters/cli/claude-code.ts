@@ -28,6 +28,7 @@ import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForF
 import { CLAUDE_REASONING_EFFORTS } from '../../services/codex-reasoning-effort.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
+import { wrapBracketedPaste } from './tui-input.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { discoverClaudeFamilySessions } from '../../services/resumable-session-discovery.js';
 
@@ -471,6 +472,7 @@ const BOTMUX_ENVELOPE_TAGS = new Set([
   'botmux_skill_help',
   'identity',
   'botmux_credentials',
+  'botmux_lark_tool',
   'session_id',
   'role',
   'summary_memory',
@@ -1094,7 +1096,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return discoverClaudeFamilySessions(variant.dataDir, limit, exclude);
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, settingsEnv, settingsFilePath, replyDelivery, solo, promptInjection }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, larkToolAppId, settingsEnv, settingsFilePath, replyDelivery, solo, promptInjection }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
@@ -1207,7 +1209,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // replyDelivery=transcript：系统提示改口为「最终回复由 botmux 自动转发」。v3 workflow
       // 子会话（GOAL_ENV.V3_MARKER）的收口靠 botmux send，强制保持 send 措辞。
       const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;
-      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport, triggerUserAuth, replyDelivery: effectiveReplyDelivery, solo }));
+      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport, triggerUserAuth, larkToolAppId, replyDelivery: effectiveReplyDelivery, solo }));
       return args;
     },
 
@@ -1325,7 +1327,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       } else {
         // Non-tmux fallback (raw PTY): bracketed paste is reliable here since
         // we control the markers directly.
-        pty.write('\x1b[200~' + sanitizedContent + '\x1b[201~');
+        pty.write(wrapBracketedPaste(sanitizedContent));
       }
       await delay(submitDelay);
       if (!sendSubmit()) {
@@ -1559,5 +1561,3 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     asksViaHook: true,
   };
 }
-
-export const create = createClaudeCodeAdapter;

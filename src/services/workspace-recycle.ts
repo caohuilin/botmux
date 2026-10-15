@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { withFileLock } from '../utils/file-lock.js';
 import { loadAllSessionsStrict } from './session-store.js';
@@ -35,6 +35,12 @@ export interface WorkspaceRecycleStatus {
   results: Array<RecycleJournal | { target: WorkspaceSessionTarget; phase: 'missing' }>;
   errors: WorkspaceRecycleOperation['errors'];
   evidencePath: string;
+}
+
+export interface WorkspaceRecycleNotPrepared {
+  ok: true;
+  status: 'not_prepared';
+  operationId: string;
 }
 
 export interface WorkspaceRecycleDeps {
@@ -155,9 +161,15 @@ export class WorkspaceRecycler {
   }
 
   /** Equivalent generic lifecycle event. A failed end NEVER closes anything.
-   * The caller supplies the same operationId stamped by its pre-end hook. */
-  async finish(operationId: string, event: { eventId: string; outcome: 'succeeded' | 'failed' }): Promise<WorkspaceRecycleStatus> {
+   * The caller supplies the same operationId stamped by its pre-end hook.
+   * An operation that was never prepared has nothing to abort, so a failed
+   * event reports not_prepared and a successful one is refused. */
+  async finish(operationId: string, event: { eventId: string; outcome: 'succeeded' | 'failed' }): Promise<WorkspaceRecycleStatus | WorkspaceRecycleNotPrepared> {
     if (!event.eventId || !['succeeded', 'failed'].includes(event.outcome)) throw new Error('invalid_recycle_completion_event');
+    if (!this.hasOperation(operationId)) {
+      if (event.outcome === 'failed') return { ok: true, status: 'not_prepared', operationId };
+      throw new Error('recycle_operation_not_prepared');
+    }
     return withFileLock(this.path(operationId), async () => {
       const operation = this.load(operationId);
       if (operation.lifecycle && JSON.stringify(operation.lifecycle) !== JSON.stringify(event)) throw new Error('recycle_event_conflict');
@@ -196,6 +208,11 @@ export class WorkspaceRecycler {
       this.save(operation);
       return this.status(operationId);
     }, { maxWaitMs: 1_500 });
+  }
+
+  /** Whether prepare ever recorded this operation. Pure read. */
+  hasOperation(operationId: string): boolean {
+    return existsSync(this.path(operationId));
   }
 
   /** Pure readback; deferred initiator completion can happen after CLI exit. */

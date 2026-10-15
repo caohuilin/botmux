@@ -108,6 +108,7 @@ import {
 } from '../src/services/session-lifecycle-hooks.js';
 import {
   detachWorkerForTransfer,
+  updateCodexAppEffort,
   initWorkerPool,
   __testOnly_setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
@@ -345,25 +346,14 @@ describe('worker-pool lifecycle hook integration', () => {
     restoreGetBot.mockRestore();
   });
 
-  it('emits session.requires_attention from tui_prompt and user_notify IPC', async () => {
+  it('emits session.requires_attention from user_notify IPC', async () => {
     const worker = makeFakeWorker();
     const ds = makeDs({ worker });
     __testOnly_setupWorkerHandlers(ds, worker);
 
-    worker.emit('message', {
-      type: 'tui_prompt',
-      description: 'Approve command?',
-      options: [{ text: 'Yes', selected: false }],
-      multiSelect: false,
-    });
     worker.emit('message', { type: 'user_notify', message: 'Need manual input' });
     await flush();
 
-    expect(emitHookEventMock).toHaveBeenCalledWith('session.requires_attention', expect.objectContaining({
-      reason: 'tui_prompt',
-      description: 'Approve command?',
-      optionsCount: 1,
-    }));
     expect(emitHookEventMock).toHaveBeenCalledWith('session.requires_attention', expect.objectContaining({
       reason: 'user_notify',
       message: 'Need manual input',
@@ -427,7 +417,7 @@ describe('worker-pool lifecycle hook integration', () => {
     expect(emitHookEventMock).not.toHaveBeenCalled();
   });
 
-  it('does not emit lifecycle hooks for receiver TUI, notifications, status, or exit', async () => {
+  it('does not emit lifecycle hooks for receiver notifications, status, or exit', async () => {
     const worker = makeFakeWorker();
     const ds = makeDs({ worker, lastScreenStatus: 'working' });
     ds.session.vcMeetingReceiver = {
@@ -438,12 +428,6 @@ describe('worker-pool lifecycle hook integration', () => {
     };
     __testOnly_setupWorkerHandlers(ds, worker);
 
-    worker.emit('message', {
-      type: 'tui_prompt',
-      description: 'Approve meeting action?',
-      options: [{ text: 'Yes', selected: false }],
-      multiSelect: false,
-    });
     worker.emit('message', { type: 'user_notify', message: 'meeting-derived diagnostic' });
     worker.emit('message', { type: 'screen_update', content: 'transcript', status: 'idle' });
     worker.emit('exit', 1);
@@ -530,6 +514,57 @@ describe('worker-pool lifecycle hook integration', () => {
     expect(ds.session.remoteBackendState?.generation).toBe(3);
     expect(startupState.onRemoteBackendStartupExit).toBeUndefined();
     expect(reconcile).not.toHaveBeenCalled();
+  });
+
+  it('keeps remote rebuild reconciliation armed for the initial same-generation state replay', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    ds.session.cliId = 'remote-runner';
+    ds.session.backendType = 'remote-runner';
+    ds.session.remoteBackendState = {
+      version: 1,
+      provider: 'reference',
+      generation: 2,
+    };
+    const reconcile = vi.fn(() => true);
+    const startupState = {
+      ready: true,
+      failureNotified: false,
+      onRemoteBackendStartupExit: reconcile,
+    };
+    __testOnly_setupWorkerHandlers(ds, worker, startupState as any);
+
+    worker.emit('message', {
+      type: 'remote_backend_state',
+      state: {
+        version: 1,
+        provider: 'reference',
+        generation: 2,
+      },
+    });
+    await flush();
+
+    expect(startupState.onRemoteBackendStartupExit).toBe(reconcile);
+    expect(reconcile).not.toHaveBeenCalled();
+
+    worker.emit('message', {
+      type: 'claude_exit',
+      code: 1,
+      signal: null,
+    });
+    await flush();
+
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(worker.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(ds.worker).toBeNull();
+    expect(sessionReply).not.toHaveBeenCalled();
   });
 
   it('clears the persisted terminal port and Dashboard proxy state on worker exit', () => {
@@ -624,5 +659,81 @@ describe('worker-pool lifecycle hook integration', () => {
       workerGeneration: 1,
       disposition: 'queued_removed',
     });
+  });
+});
+
+describe('Codex App effort IPC', () => {
+  it('correlates the receipt while keeping a busy business turn intact', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerReady: true, cliReady: true, lastScreenStatus: 'working' });
+    ds.session.cliId = 'codex-app';
+    const before = { ...ds };
+    const pending = updateCodexAppEffort(ds, 'high');
+    const request = worker.send.mock.calls[0][0];
+    expect(request).toMatchObject({ type: 'codex_app_effort', effort: 'high' });
+    worker.emit('message', { type: 'codex_app_effort_result', requestId: 'another-request', status: 'error' });
+    expect(worker.listenerCount('message')).toBe(1);
+    worker.emit('message', { type: 'codex_app_effort_result', requestId: request.requestId, status: 'applied' });
+    expect(await pending).toMatchObject({ status: 'applied' });
+    expect(worker.listenerCount('message')).toBe(0);
+    expect(worker.listenerCount('exit')).toBe(0);
+    expect(worker.send).toHaveBeenCalledTimes(1);
+    expect(ds).toEqual(before);
+  });
+
+  it.each(['timeout', 'exit', 'replacement'] as const)('cleans up on %s without accepting a stale success', async mode => {
+    vi.useFakeTimers();
+    try {
+      const worker = makeFakeWorker();
+      const ds = makeDs({ worker, workerReady: true, cliReady: true });
+      ds.session.cliId = 'codex-app';
+      const pending = updateCodexAppEffort(ds, 'high', 100);
+      const request = worker.send.mock.calls[0][0];
+      if (mode === 'timeout') await vi.advanceTimersByTimeAsync(100);
+      else if (mode === 'exit') worker.emit('exit', 1);
+      else {
+        ds.worker = makeFakeWorker();
+        worker.emit('message', { type: 'codex_app_effort_result', requestId: request.requestId, status: 'applied' });
+      }
+      expect(await pending).toEqual({ status: 'error' });
+      expect(worker.listenerCount('message')).toBe(0);
+      expect(worker.listenerCount('exit')).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(['codex-app', 'codex'] as const)('uses the frozen %s CLI before session and init config', async cliId => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerReady: true, cliReady: true });
+    ds.session.cliId = cliId === 'codex-app' ? 'codex' : 'codex-app';
+    ds.initConfig = { cliId: ds.session.cliId } as NonNullable<DaemonSession['initConfig']>;
+    ds.session.cliLaunchSnapshot = {
+      version: 1, state: 'pending', entryId: cliId, cliId, cliRuntime: null,
+      cliPathOverride: null, wrapperCli: null, model: null, reasoningEffort: null,
+      launchShell: null, startupCommands: [],
+    };
+    const pending = updateCodexAppEffort(ds, 'high');
+    if (cliId === 'codex-app') {
+      const request = worker.send.mock.calls[0][0];
+      worker.emit('message', {
+        type: 'codex_app_effort_result', requestId: request.requestId,
+        status: 'future_only', reason: 'step_model_switching_disabled',
+      });
+      expect(await pending).toMatchObject({ status: 'future_only', reason: 'step_model_switching_disabled' });
+    } else {
+      expect(await pending).toEqual({ status: 'unavailable' });
+      expect(worker.send).not.toHaveBeenCalled();
+    }
+  });
+
+  it('rejects unready and ordinary CLI sessions before sending', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerReady: true, cliReady: true });
+    expect(await updateCodexAppEffort(ds, 'high')).toEqual({ status: 'unavailable' });
+    ds.session.cliId = 'codex-app';
+    ds.cliReady = false;
+    expect(await updateCodexAppEffort(ds, 'high')).toEqual({ status: 'unavailable' });
+    expect(worker.send).not.toHaveBeenCalled();
   });
 });

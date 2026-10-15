@@ -506,9 +506,20 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
     // owning that same failure during backoff/exhaustion so the late diagnostic
     // cannot duplicate the coordinator's notice. New input/cancellation fences
     // the old identity out through the registry below.
-    return current.status !== 'cancelled' && current.status !== 'completed'
+    // A dispatched continuation proves the logical turn's capacity failure
+    // was already consumed. Its delayed rollout diagnostic remains obsolete
+    // even after successful recovery; a cancelled recovery keeps normal UI.
+    const recoveredPredecessor = this.handlesRecoveredPredecessor(terminal, current);
+    return current.status !== 'cancelled'
+      && (current.status !== 'completed' || recoveredPredecessor)
       && terminal.status === 'failed'
       && this.deps.recoverableErrorCodes.includes(terminal.errorCode ?? '');
+  }
+
+  handlesRecoveredPredecessor(terminal: OrdinaryTurnRecoveryTerminal, current: OrdinaryTurnRecoveryState): boolean {
+    return terminal.status === 'failed'
+      && this.deps.recoverableErrorCodes?.includes(terminal.errorCode ?? '') === true
+      && current.continuationsStarted > 0 && terminal.turnId === current.logicalTurnId;
   }
 }
 
@@ -622,6 +633,7 @@ export function ordinaryTurnRecoveryHandlesTerminal(
   if (attachedRecoveries.get(session.sessionId)?.session !== session || !current) return false;
   if (!attachedRecoveries.get(session.sessionId)!.coordinator.handlesTerminal(terminal, current)) return false;
   if (current.currentTurnId === terminal.turnId) return true;
+  if (attachedRecoveries.get(session.sessionId)!.coordinator.handlesRecoveredPredecessor(terminal, current)) return true;
   // A queued type-ahead successor is adopted by onTerminal only while the
   // original owner itself is still running (no continuation dispatched); in any
   // other state its terminal is merely forgotten and the fallback notice must

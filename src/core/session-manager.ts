@@ -1,3 +1,4 @@
+import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './prompt-injection.js';
 /**
  * Session manager — session helper functions extracted from daemon.ts.
@@ -7,7 +8,7 @@ import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection
 import { existsSync, statSync } from 'node:fs';
 import { normalizeImageAttachment, imageSequenceHint } from './attachment-image-format.js';
 import { randomUUID } from 'node:crypto';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { expandHome, validateWorkingDir } from './working-dir.js';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
@@ -17,11 +18,12 @@ import { updateRuntimeTaskState } from './scheduler.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
-import { buildBotmuxShellHints, buildCredentialBoundaryBlock } from '../adapters/cli/shared-hints.js';
+import { buildBotmuxShellHints, buildManagedLarkToolPromptBlocks } from '../adapters/cli/shared-hints.js';
+import { usesLarkToolBinding } from './lark-tool-binding.js';
 import { effectiveReplyDelivery, type ReplyDelivery } from './reply-delivery.js';
 import {
   resolveSkillInjectionModeForApp,
@@ -33,13 +35,10 @@ import { resolveConditionalLine } from '../skills/effective-builtins.js';
 import {
   getSessionPersistentBackendType,
   persistentBackendTargetForSession,
-  persistentSessionName,
   probePersistentBackendTarget,
-  probePersistentSession,
   probePersistentBackendTargets,
   persistentBackendTargetKey,
   killPersistentBackendTarget,
-  killPersistentSession,
   type PersistentBackendType,
 } from './persistent-backend.js';
 import type { PersistentBackendTarget } from '../adapters/backend/types.js';
@@ -62,7 +61,7 @@ import {
   type Coworker,
 } from './session-create.js';
 import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
-import type { BackendType, SessionProbe } from '../adapters/backend/types.js';
+import type { BackendType } from '../adapters/backend/types.js';
 import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
 import type { ChatContext, CliTurnPayload, CodexAppAdditionalContextEntry, CodexAppTurnInput, LarkAttachment, LarkMention, ScheduledTask, Session, SubstituteTrigger } from '../types.js';
 import { trustedCallerForScheduledTask } from './scheduled-turn-provenance.js';
@@ -97,6 +96,10 @@ import { getAttachmentsDir } from './attachment-path.js';
 import { resolveRegularGroupMode } from '../services/chat-reply-mode-store.js';
 import { beginReplyTargetTurn } from './reply-target.js';
 import { readDeferredTopicBinding, removeDeferredTopicBinding } from './deferred-topic-binding.js';
+import {
+  hasScheduleTopicTitleRuntimeTemplate,
+  renderScheduleTopicTitle,
+} from './schedule-topic-title.js';
 import { escapeXmlTagLikeTokens } from '../utils/xml.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { writePromptContext } from '../services/prompt-context-store.js';
@@ -106,7 +109,6 @@ import { readGroupCollaborationMode } from '../services/group-collaboration-mode
 import { createHeadlessRecord, headlessChatId, newHeadlessId, saveHeadlessSession } from '../services/headless-session-store.js';
 import {
   reconcileXpiSharedCwdRecovery,
-  type XpiSharedCwdQuarantineNotice,
   type XpiSharedCwdStartupNotice,
 } from './xpi-shared-cwd-admission.js';
 import {
@@ -236,6 +238,10 @@ async function resumeRestoredPendingRepoSetup(
         codexAppText: ds.pendingCodexAppText,
         codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
         codexAppMessageContext: ds.pendingCodexAppMessageContext,
+        // This recovery completes the original fresh pending-repo launch.
+        // `hasHistory` may be true after daemon restore, but the paired
+        // forkWorker call below is authoritatively resume:false.
+        larkToolResume: false,
       },
     );
     rememberLastCliInput(ds, setup.prompt, input);
@@ -550,55 +556,6 @@ export async function closeCliMismatchedSessionsForBot(
     }
   }
   return { closed, residual, failed };
-}
-
-/**
- * Suspend (kill the CLI/pane, keep the session active) every non-queued,
- * non-adopt active session of a bot, so the NEXT message cold-restarts them.
- * Used by the read-isolation toggle: read isolation is applied only at cold
- * spawn (via provisionIsolatedBotHome + the Seatbelt wrapper), so flipping the
- * flag must force a cold restart — otherwise a user who close+resumes keeps
- * running the old (un-provisioned) state and the toggle silently no-ops.
- * Exemptions mirror closeCliMismatchedSessionsForBot (queued never started a
- * CLI; adopt sessions own a user's external CLI). Returns the count suspended.
- */
-export async function suspendActiveSessionsForBot(larkAppId: string): Promise<number> {
-  const registry = getActiveSessionsRegistry();
-  if (!registry) return 0;
-  let restarted = 0;
-  for (const ds of [...registry.values()]) {
-    if (ds.larkAppId !== larkAppId) continue;
-    if (ds.session.queued) continue;
-    if (isSharedAdoptSession(ds) || ds.session.title?.startsWith('Adopt:')) continue;
-    // A settings helper is never an explicit abandon boundary. In particular,
-    // suspendWorker intentionally refuses pending Codex App ownership; do not
-    // reinterpret that refusal as permission to close and erase the FIFO.
-    if (hasProtectedSessionMutationOwnership(ds)) continue;
-    if (isSessionTransferring(ds)) {
-      logger.warn(
-        `[${ds.session.sessionId.substring(0, 8)}] Read-isolation cold restart deferred during routing transfer`,
-      );
-      continue;
-    }
-    // Prefer suspend (keeps the session; --resume continues context on the next
-    // message). But suspendWorker no-ops for a NON-suspendable backend (explicit
-    // PTY) — leaving the old unisolated process running would silently defeat the
-    // toggle. Fall back to closeSession there so the stale process is torn down and
-    // the next message cold-spawns fresh under the new isolation state either way.
-    if (suspendWorker(ds, 'read_isolation_toggle')) {
-      restarted++;
-    } else if (ds.worker && !ds.worker.killed) {
-      // suspendWorker no-op'd but a LIVE worker is running → non-suspendable
-      // backend (explicit PTY). Close it so the stale unisolated process is torn
-      // down (next message cold-spawns fresh under the new flag).
-      await closeSession(ds.session.sessionId);
-      restarted++;
-    }
-    // else: no live worker (already idle-suspended) → the next message already
-    // cold-resumes; it'll pick up the new isolation flag. Don't close it (that
-    // would delete a resumable idle session).
-  }
-  return restarted;
 }
 
 // ─── Path helpers ────────────────────────────────────────────────────────────
@@ -1220,10 +1177,49 @@ function sessionIsNoTransport(larkAppId?: string, chatId?: string): boolean {
   return !larkTransportEnabled({ chatId, apiOnly });
 }
 
-function credentialBoundaryForPrompt(larkAppId: string | undefined, locale?: Locale): string {
+function managedLarkToolAppIdForPrompt(
+  larkAppId: string | undefined,
+  sessionId: string,
+  chatId: string | undefined,
+  resume: boolean,
+): string | undefined {
+  if (!larkAppId) return undefined;
+  if (!chatId) return undefined;
+  try {
+    const botConfig = getBot(larkAppId).config;
+    const session = sessionStore.getSession(sessionId);
+    return usesLarkToolBinding({
+      sessionId,
+      larkAppId,
+      chatId,
+      apiOnly: botConfig.apiOnly,
+      resume,
+      forkSession: session?.pendingForkSession,
+      adoptMode: !!session?.adoptedFrom,
+      existingAppServerEndpoint: session?.existingAppServerEndpoint,
+      backendType: session?.backendType ?? botConfig.backendType ?? config.daemon.backendType,
+    }, config.session.dataDir, process.env.BOTMUX_WORKFLOW === '1')
+      ? larkAppId
+      : undefined;
+  } catch { return undefined; }
+}
+
+function credentialBoundaryForPrompt(
+  larkAppId: string | undefined,
+  sessionId: string,
+  chatId: string | undefined,
+  resume: boolean,
+  locale?: Locale,
+): string {
   if (!larkAppId) return '';
-  try { return buildCredentialBoundaryBlock(getBot(larkAppId).config.triggerUserAuth, locale); }
-  catch { return ''; }
+  try {
+    const policy = getBot(larkAppId).config.triggerUserAuth;
+    return buildManagedLarkToolPromptBlocks(
+      policy,
+      managedLarkToolAppIdForPrompt(larkAppId, sessionId, chatId, resume),
+      locale,
+    );
+  } catch { return ''; }
 }
 
 /** 本会话的最终回复投递方式（per-bot replyDelivery × 该 CLI 的转写能力，见
@@ -1281,6 +1277,13 @@ type NewTopicOpts = {
   sharedGroupContext?: string;
   turnId?: string;
   sessionBackendType?: BackendType;
+  /** Exact worker launch decision for this opening input. This cannot be
+   * inferred from persisted prompt/history fields: a failed fresh start may
+   * already have lastCliInput, while a legacy empty-start session may deliver
+   * its first user message through an already resumed live worker. Omission is
+   * treated as resume=true (legacy-safe): an uncertain caller must not claim a
+   * managed bot binding that may not exist. */
+  larkToolResume?: boolean;
   /** replyDelivery=transcript 且本轮是 solo 会话（daemon 算好的 ds.soloSession）：
    *  去掉 <user_message> 壳与 sender/attachments/mentions 块，改用裸文本 +
    *  `[附件]`/`[@提及]` 行（buildBridgeInputContent）。send 模式下忽略。 */
@@ -1333,9 +1336,11 @@ function buildNewTopicBlocks(
   const noTransport = sessionIsNoTransport(opts?.larkAppId, opts?.chatId);
   const replyDelivery: ReplyDelivery = noTransport ? 'send' : replyDeliveryFor(opts?.larkAppId, cliId, opts?.promptInjection);
   const bare = replyDelivery === 'transcript' && opts?.solo === true;
+  // cliId only adds the Cursor background-task note (#1504); every other CLI's
+  // hint list is unchanged.
   const hints = adapter.injectsSessionContext
     ? []
-    : buildBotmuxShellHints(locale, noTransport, replyDelivery);
+    : buildBotmuxShellHints(locale, noTransport, replyDelivery, cliId);
 
   const routingBlock = hints.length > 0
     ? `<botmux_routing>\n${hints.join('\n')}\n</botmux_routing>`
@@ -1442,7 +1447,13 @@ function buildNewTopicBlocks(
     // hook-capable this is the difference between the agent seeing the boundary
     // and not. An envelope the CLI cannot read drops the block silently —
     // nothing errors when a constraint is merely absent.
-    const credentialBoundary = credentialBoundaryForPrompt(opts?.larkAppId, locale);
+    const credentialBoundary = credentialBoundaryForPrompt(
+      opts?.larkAppId,
+      sessionId,
+      opts?.chatId,
+      opts?.larkToolResume !== false,
+      locale,
+    );
     if (credentialBoundary) blocks.push({ key: 'credentials', text: credentialBoundary });
     blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
   }
@@ -1540,6 +1551,8 @@ export function buildNewTopicCliInput(
     turnId?: string;
     /** 会话冻结的后端类型，用于 hook 模式判定（远端后端无本地 hook 进程）。 */
     sessionBackendType?: BackendType;
+    /** 见 NewTopicOpts 同名字段。 */
+    larkToolResume?: boolean;
   },
 ): CliTurnPayload {
   opts = { ...opts, promptInjection: opts?.promptInjection ?? inputPromptInjection(sessionId, opts?.larkAppId, cliId) };
@@ -2082,61 +2095,6 @@ export function buildBridgeInputContent(
 
 /** Sentinel value (CARD_POSTING_SENTINEL from worker-pool) we must skip — it marks an in-flight POST, not a real message_id. */
 const STREAM_CARD_SENTINEL = '__posting__';
-
-/**
- * Build the prompt that gets piped into a freshly-spawned CLI when an existing
- * (non-bridge) session re-forks its worker. Hits the `worker=null` re-fork
- * branch in handleThreadReply: resume after /close, daemon-restart + new
- * message, and any other path that lands a new turn without a live worker.
- *
- * Without wrapping, the worker would queue the user's raw text as the initial
- * prompt — the CLI sees no `<user_message>` / `<botmux_reminder>` envelope
- * and answers in its own terminal instead of calling `botmux send`.  This
- * helper centralises the wrap so both daemon.ts and tests agree on the shape.
- *
- * Adopt-bridge sessions go through `buildBridgeInputContent` instead — see
- * the buildBridgeInputContent docstring for why bridge prompts intentionally
- * skip botmux routing tags.
- */
-export function buildReforkPrompt(
-  ds: DaemonSession,
-  content: string,
-  opts?: {
-    attachments?: LarkAttachment[];
-    mentions?: LarkMention[];
-    cliId?: CliId;
-    cliPathOverride?: string;
-    selfMention?: { name?: string | null; openId?: string | null };
-    locale?: Locale;
-    sender?: ResolvedSender;
-  },
-): string {
-  const locale = opts?.locale ?? localeForBot(ds.larkAppId);
-  if (ds.adoptedFrom) {
-    return buildBridgeInputContent(content, {
-      attachments: opts?.attachments,
-      mentions: opts?.mentions,
-      selfMention: opts?.selfMention,
-      locale,
-    });
-  }
-  return buildFollowUpContent(content, ds.session.sessionId, {
-    attachments: opts?.attachments,
-    mentions: opts?.mentions,
-    isAdoptMode: false,
-    cliId: opts?.cliId,
-    cliPathOverride: opts?.cliPathOverride,
-    locale,
-    sender: opts?.sender,
-    larkAppId: ds.larkAppId,
-    chatId: ds.session.chatId,
-    whiteboardId: ds.session.whiteboardId,
-    sessionBackendType: ds.session.backendType,
-    promptInjection: sessionPromptInjection(ds),
-    solo: ds.soloSession,
-    selfMention: opts?.selfMention,
-  });
-}
 
 /** Structured refork variant. Adopted external CLIs intentionally remain on
  * their existing raw bridge path and never receive a Codex App sidecar. */
@@ -3267,11 +3225,19 @@ export async function restoreActiveSessions(
   // not wake while a later row is still competing for the same route.
   for (const ds of restoredByThisInvocation) {
     if (!stillOwnsRestoreRegistration(ds)) continue;
-    ensureOrdinaryTurnRecoveryAttached(ds);
-    const restoredLeaseId = interruptedReadonlyContinuationLeaseIds.get(ds.session.sessionId);
-    if (!restoredLeaseId
-      || !markReadonlyTaskContinuationInterruptedByRestart(ds, restoredLeaseId)) {
-      ensureReadonlyTaskContinuationAttached(ds);
+    try {
+      ensureOrdinaryTurnRecoveryAttached(ds);
+      const restoredLeaseId = interruptedReadonlyContinuationLeaseIds.get(ds.session.sessionId);
+      if (!restoredLeaseId
+        || !markReadonlyTaskContinuationInterruptedByRestart(ds, restoredLeaseId)) {
+        ensureReadonlyTaskContinuationAttached(ds);
+      }
+    } catch (err) {
+      logger.error(
+        `[${ds.session.sessionId.substring(0, 8)}] Isolated recovery re-arm failure; `
+        + `durable row retained and daemon startup continuing: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 
@@ -3777,6 +3743,11 @@ export async function resumeSession(
     lastCodexAppInput: session.lastCodexAppInput,
     replyThreadAliases: session.replyThreadAliases,
     currentReplyTarget: session.currentReplyTarget,
+    // A Remote Runner resume is only provisionally active until its rebuilt
+    // provider generation publishes a durable remoteSessionId. Do not let the
+    // worker's ready/screen events overwrite the still-canonical closed card;
+    // durable lifecycle commit releases this gate after RDS becomes active.
+    suppressRecoveryCard: remoteRunnerResume ? true : undefined,
   };
 
   messageQueue.ensureQueue(anchor);
@@ -3862,6 +3833,19 @@ export async function resumeSession(
     }
   }
   logger.info(`Resumed session ${sessionId.substring(0, 8)} (scope: ${scope}, anchor: ${anchor.substring(0, 12)})`);
+  // A session group's resident is its chat-scope session. Closing no longer
+  // auto-resumes, so any recovery path (close card, /resume, /adopt <id>, CLI)
+  // may bring back an older resident; keep the registry pointing at it so
+  // /dismiss sees the live resident. No-op for chats that are not session groups.
+  if (scope === 'chat' && isSessionGroup(session.chatId)) touchSessionGroup(session.chatId, sessionId);
+  // Flip connected dashboards back to active for every recovery path (close
+  // card, /resume, /adopt <id>, HTTP, durable control). `null`, not undefined,
+  // so the SSE patch actually clears closedAt. Idempotent with callers that
+  // also publish.
+  dashboardEventBus.publish({
+    type: 'session.update',
+    body: { sessionId, patch: { status: 'active', closedAt: null } },
+  });
   return {
     ok: true,
     ds,
@@ -4029,6 +4013,19 @@ export async function executeScheduledTask(
   // target when a chat-scope session already has another turn queued.
   const scheduledTurnId = `schedule:${task.id}:${randomUUID()}`;
   const scheduledTrustedCaller = trustedCallerForScheduledTask(task, larkAppId);
+  const rawTopicTitle = task.topicTitle?.trim();
+  const createsOwnTopic = executionPosition === 'new-topic' || executionPosition === 'task';
+  const hasDynamicTopicTitle = !!rawTopicTitle
+    && hasScheduleTopicTitleRuntimeTemplate(rawTopicTitle);
+  if (silent && createsOwnTopic && hasDynamicTopicTitle) {
+    throw new Error('topic_title_template_silent_unsupported');
+  }
+  const topicTitle = rawTopicTitle && createsOwnTopic && !silent && hasDynamicTopicTitle
+    ? renderScheduleTopicTitle(rawTopicTitle, {
+        firedAt: new Date(),
+        ownerOpenId: task.ownerOpenId,
+      })
+    : rawTopicTitle;
 
   // Decide where to route the "🕐 task started" notification and where the
   // session conversation lands.
@@ -4074,7 +4071,9 @@ export async function executeScheduledTask(
           logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
         });
       }
-      const topicSeed = task.topicTitle?.trim()
+      // A custom title is the actual text root; without one the localized
+      // task-start notice remains the backwards-compatible seed.
+      const topicSeed = topicTitle
         || t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId));
       anchor = await sendMessage(larkAppId, task.chatId, topicSeed);
       isContinuation = false;
@@ -4131,7 +4130,9 @@ export async function executeScheduledTask(
               logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
             });
           }
-          const topicSeed = task.topicTitle?.trim()
+          // Dedicated tasks use the same rendered fire-time title contract as
+          // new-topic runs, but persist this first root for later continuations.
+          const topicSeed = topicTitle
             || t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId));
           const seed = await sendMessage(larkAppId, task.chatId, topicSeed);
           // Write the root straight into the task row (store call, not the
@@ -4373,6 +4374,12 @@ export async function executeScheduledTask(
             + `(running on ${existing.session.model ?? 'the CLI default'})`,
           );
         }
+        // Identity preparation may reject after a concurrent pause/revocation.
+        // Run it before changing the retained conversation's routing or prompt.
+        await runtime?.prepareTurnIdentity?.(existing, scheduledTurnId);
+        if (activeSessions.get(key) !== existing || existing.session.status !== 'active') {
+          throw new Error(`scheduled continuation lost active session ${existing.session.sessionId}`);
+        }
         markSessionActivity(existing);
         ensureSessionWhiteboard(existing);
         if (existing.session.deferredScheduleRun
@@ -4400,7 +4407,6 @@ export async function executeScheduledTask(
           turnId: scheduledTurnId,
           trustedCaller: scheduledTrustedCaller,
         });
-        await runtime?.prepareTurnIdentity?.(existing, scheduledTurnId);
         rememberLastCliInput(existing, task.prompt, input);
         if (silent) armSilentScheduledTurn(existing, scheduledTurnId);
         if (existing.worker && !existing.worker.killed) {
@@ -4478,7 +4484,7 @@ export async function executeScheduledTask(
         taskId: task.id,
         turnId: scheduledTurnId,
         routingAnchor: anchor,
-        ...(task.topicTitle?.trim() ? { topicTitle: task.topicTitle.trim() } : {}),
+        ...(topicTitle ? { topicTitle } : {}),
         createdAt: new Date(now).toISOString(),
       };
     }
@@ -4516,7 +4522,25 @@ export async function executeScheduledTask(
       sessionStore.updateSession(ds.session);
     }
     ensureSessionWhiteboard(ds);
-    const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, ds.session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId, ds.session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId, trustedCaller: scheduledTrustedCaller, promptInjection: sessionPromptInjection(ds) });
+    const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, ds.session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId, ds.session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, {
+      larkAppId,
+      chatId: task.chatId,
+      whiteboardId: ds.session.whiteboardId,
+      trustedCaller: scheduledTrustedCaller,
+      promptInjection: sessionPromptInjection(ds),
+      // This branch always creates a fresh Session; the paired forkWorker call
+      // below receives no resume flag.
+      larkToolResume: false,
+    });
+    // Keep the candidate out of the live registry until authorization succeeds.
+    // On rejection there is no worker or activation journal to recover: close
+    // its durable row so the next fire can create a fresh candidate.
+    try {
+      await runtime?.prepareTurnIdentity?.(ds, scheduledTurnId);
+    } catch (err) {
+      sessionStore.closeSession(session.sessionId);
+      throw err;
+    }
     // Compare-and-set registration (master): a concurrent creator/restore may
     // have claimed this anchor between the scratch cleanup above and here.
     // Refuse to overwrite the live occupant, retire THIS rejected candidate's
@@ -4532,7 +4556,6 @@ export async function executeScheduledTask(
     rememberLastCliInput(ds, task.prompt, prompt);
     if (silent) armSilentScheduledTurn(ds, scheduledTurnId);
     try {
-      await runtime?.prepareTurnIdentity?.(ds, scheduledTurnId);
       forkWorker(ds, prompt, scheduledTurnId);
     } catch (err) {
       if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);
@@ -4628,6 +4651,9 @@ async function forkOrShowRepoCard(
       codexAppMessageContext: ds.pendingCodexAppMessageContext,
       codexAppFollowUps: ds.pendingCodexAppFollowUps,
       codexAppFollowUpContexts: ds.pendingCodexAppFollowUpContexts,
+      // createSession's direct/pending-repo launch is fresh. Any continuation
+      // was handled before this builder is reached.
+      larkToolResume: false,
     },
   );
 
@@ -4807,6 +4833,10 @@ export async function spawnDashboardSession(
   const codexAppMessageContext = composeSpawnCodexAppContext({ role, coworkers: args.coworkers, locale });
 
   const registered = await withActiveSessionKeyLock(activeSessions, key, async () => {
+    // Re-check under the key lock: the scan above runs before the banner /
+    // attachment awaits, so a restore can quarantine this anchor in between.
+    // Every other creation path performs this check at registration time.
+    if (findQuarantinedRoutingConflict(key, larkAppId)) return undefined;
     const current = activeSessions.get(key);
     if (current) {
       const protectedOwner = current.worker || current.session.queued || current.pendingRepo

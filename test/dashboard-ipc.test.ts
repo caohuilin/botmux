@@ -1,5 +1,10 @@
 // test/dashboard-ipc.test.ts
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
+import { validateCodexServiceTier } from '../src/services/codex-service-tier-catalog.js';
+
+vi.mock('../src/services/codex-service-tier-catalog.js', () => ({
+  validateCodexServiceTier: vi.fn(async () => ({ ok: true })),
+}));
 import { createHmac, randomBytes } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
@@ -42,6 +47,8 @@ import { clearMessageListenerRunPreviewStore, markMessageListenerRunPreviewRepli
 import * as persistentBackend from '../src/core/persistent-backend.js';
 import { __testOnly_resetBotRegistry, getBot, loadBotConfigs, registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
+import { createTurnResultRuntime, setTurnResultRuntime } from '../src/core/turn-result-runtime.js';
+import { TurnResultStore } from '../src/services/turn-result-store.js';
 import { setDeploymentOwner } from '../src/services/deployment-identity.js';
 import { sessionKey } from '../src/core/types.js';
 import { writeRoleFile, writeTeamRoleFile } from '../src/core/role-resolver.js';
@@ -202,10 +209,80 @@ afterEach(async () => {
   setExactChatGrantHandler(null);
   setCrossPrincipalInterruptionDisableHandler(null);
   setDurableSessionSendHandler(null);
+  setTurnResultRuntime(undefined);
   clearMessageListenerRunPreviewStore();
 });
 
 describe('dashboard IPC server', () => {
+  it('turn result reads require host HMAC and exact bot, turn and attempt', async () => {
+    const appId = 'app_result_ipc';
+    registerBot({ larkAppId: appId, larkAppSecret: 'fixture', turnResults: { enabled: true } });
+    setLarkAppId(appId);
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    const runtime = createTurnResultRuntime({ store: new TurnResultStore(), enabled: () => true, eligible: () => true, owns: () => true });
+    setTurnResultRuntime(runtime);
+    const binding = { ref: { botId: appId, sessionId: 'sid_result', turnId: 'om_result' },
+      source: { kind: 'im' as const, platform: 'lark', chatId: 'oc_result', messageId: 'om_result' }, workerGeneration: 1 };
+    runtime.begin(binding);
+    runtime.delivery(binding, { status: 'available', content: 'complete public result', format: 'markdown', source: 'transcript' },
+      { channel: 'im', status: 'delivered', messages: [{ messageId: 'om_sent', kind: 'primary' }] });
+    runtime.terminal(binding, { status: 'completed' });
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true, coreOnlyPublicRoutes: true });
+    const path = '/api/sessions/sid_result/turns/om_result/result';
+    const url = `http://127.0.0.1:${handle.port}${path}`;
+    expect((await fetch(url)).status).toBe(401);
+    const response = await fetch(url, { headers: trustedHostHeaders('GET', path, handle.port) });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ status: 'ready', result: { ref: binding.ref, output: { content: 'complete public result' } } });
+    const attempt = await fetch(`${url}?dispatchAttempt=0`, { headers: trustedHostHeaders('GET', path, handle.port) });
+    expect(await attempt.json()).toEqual({ status: 'not_found' });
+    const invalid = await fetch(`${url}?dispatchAttempt=0&dispatchAttempt=1`, { headers: trustedHostHeaders('GET', path, handle.port) });
+    expect(invalid.status).toBe(400);
+    registerBot({ larkAppId: appId, larkAppSecret: 'fixture' });
+    registerBot({ larkAppId: appId, larkAppSecret: 'fixture', turnResults: { enabled: true } });
+    const revoked = await fetch(url, { headers: trustedHostHeaders('GET', path, handle.port) });
+    expect(await revoked.json()).toEqual({ status: 'not_found' });
+    registerBot({ larkAppId: appId, larkAppSecret: 'fixture' });
+    const disabled = await fetch(url, { headers: trustedHostHeaders('GET', path, handle.port) });
+    expect(await disabled.json()).toEqual({ status: 'unavailable', reason: 'disabled' });
+    registerBot({ larkAppId: appId, larkAppSecret: 'fixture', turnResults: { enabled: true } });
+    const reenabled = await fetch(url, { headers: trustedHostHeaders('GET', path, handle.port) });
+    expect(await reenabled.json()).toEqual({ status: 'not_found' });
+    setLarkAppId('app_other');
+    const foreign = await fetch(url, { headers: trustedHostHeaders('GET', path, handle.port) });
+    expect(await foreign.json()).toEqual({ status: 'not_found' });
+    setTurnResultRuntime(undefined);
+  });
+
+  it('turn result access is disabled by default and withdrawing enablement discards content', async () => {
+    const appId = 'app_result_disabled';
+    registerBot({ larkAppId: appId, larkAppSecret: 'fixture' });
+    setLarkAppId(appId);
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const path = '/api/sessions/sid_result/turns/om_result/result';
+    const response = await fetch(`http://127.0.0.1:${handle.port}${path}`, { headers: trustedHostHeaders('GET', path, handle.port) });
+    expect(await response.json()).toEqual({ status: 'unavailable', reason: 'disabled' });
+  });
+  it('turn result normalization is explicitly opt-in', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'turn-result-config-'));
+    const path = join(dir, 'bots.json');
+    const previous = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = path;
+      writeFileSync(path, JSON.stringify([
+        { larkAppId: 'app_on', larkAppSecret: 'fixture', turnResults: { enabled: true } },
+        { larkAppId: 'app_off', larkAppSecret: 'fixture', turnResults: { enabled: false } },
+        { larkAppId: 'app_invalid', larkAppSecret: 'fixture', turnResults: { enabled: 'true' } },
+      ]));
+      const parsed = loadBotConfigs();
+      expect(parsed.map(item => item.turnResults)).toEqual([{ enabled: true }, undefined, undefined]);
+    } finally {
+      if (previous === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
   it('persists an acyclic quota fallback and rejects an impending cycle atomically', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-quota-fallback-'));
     const configPath = join(dir, 'bots.json');
@@ -7460,6 +7537,74 @@ describe('PUT /api/bot-agent', () => {
     }
   });
 
+  it('persists codex serviceTier, keeps explicit default, and clears it on unsupported CLI', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-service-tier-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-codex-service-tier';
+    const previous = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex' }]));
+      loadBotConfigs().forEach(c => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const save = (body: Record<string, unknown>) => fetch(`${base}/api/bot-agent`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      const saved = await save({ cliId: 'codex', model: '', serviceTier: 'priority' });
+      expect(saved.status).toBe(200);
+      expect(await saved.json()).toMatchObject({ ok: true, serviceTier: 'priority' });
+      expect(loadBotConfigs()[0]?.serviceTier).toBe('priority');
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json()).toMatchObject({ serviceTier: 'priority' });
+
+      const invalid = await save({ cliId: 'codex', model: '', serviceTier: 'fast' });
+      expect(invalid.status).toBe(400);
+      expect(await invalid.json()).toMatchObject({ error: 'invalid_service_tier' });
+      expect(loadBotConfigs()[0]?.serviceTier).toBe('priority');
+
+      const explicitDefault = await save({ cliId: 'codex', model: '', serviceTier: 'default' });
+      expect(explicitDefault.status).toBe(200);
+      expect(await explicitDefault.json()).toMatchObject({ serviceTier: 'default' });
+      expect(loadBotConfigs()[0]?.serviceTier).toBe('default');
+
+      const cleared = await save({ cliId: 'codex', model: '', serviceTier: null });
+      expect(cleared.status).toBe(200);
+      expect(await cleared.json()).toMatchObject({ serviceTier: null });
+      expect(loadBotConfigs()[0]?.serviceTier).toBeUndefined();
+
+      const restored = await save({ cliId: 'codex', model: '', serviceTier: 'priority' });
+      expect(restored.status).toBe(200);
+      expect(await restored.json()).toMatchObject({ serviceTier: 'priority' });
+      expect(loadBotConfigs()[0]?.serviceTier).toBe('priority');
+
+      vi.mocked(validateCodexServiceTier).mockResolvedValueOnce({ ok: false, error: 'not_supported_by_model' });
+      const unsupportedModel = await save({ cliId: 'codex', model: 'gpt-6-astra', serviceTier: 'priority' });
+      expect(unsupportedModel.status).toBe(400);
+      expect(await unsupportedModel.json()).toMatchObject({ error: 'service_tier_not_supported_by_model' });
+      expect(loadBotConfigs()[0]?.serviceTier).toBe('priority');
+
+      vi.mocked(validateCodexServiceTier).mockResolvedValueOnce({ ok: false, error: 'catalog_unavailable' });
+      const changedModel = await save({ cliId: 'codex', model: 'gpt-6-astra' });
+      expect(changedModel.status).toBe(400);
+      expect(await changedModel.json()).toMatchObject({ error: 'service_tier_catalog_unavailable' });
+      expect(loadBotConfigs()[0]?.serviceTier).toBe('priority');
+      expect(loadBotConfigs()[0]?.model).toBeUndefined();
+
+      const switched = await save({ cliId: 'claude-code', model: '' });
+      expect(switched.status).toBe(200);
+      expect(await switched.json()).toMatchObject({ serviceTier: null });
+      expect(loadBotConfigs()[0]?.serviceTier).toBeUndefined();
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json()).toMatchObject({ serviceTier: null });
+    } finally {
+      if (previous === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('rejects switching a sandboxed bot to Forge x TraeX', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-forge-sandbox-conflict-'));
     const configPath = join(dir, 'bots.json');
@@ -9363,6 +9508,8 @@ describe('GET /api/groups (Phase B)', () => {
       name: 'team',
       oncallChat: null,
       serialInput: false,
+      idleClose: { enabled: false, duration: 1, unit: 'days' },
+      replyMode: { override: null, default: 'chat-topic', effective: 'chat-topic', inherited: true },
       firstSeenAt: null,
       hasRole: false,
       hasMessageListener: false,
@@ -9370,6 +9517,9 @@ describe('GET /api/groups (Phase B)', () => {
       pinStreamingCardMasterEnabled: false,
       pinStreamingCardChatEnabled: true,
       pinStreamingCardEffectiveEnabled: false,
+      streamingCardMasterEnabled: true,
+      streamingCardChatEnabled: true,
+      streamingCardEffectiveEnabled: true,
     }]);
     spy.mockRestore();
   });
@@ -9401,6 +9551,8 @@ describe('GET /api/groups (Phase B)', () => {
         agentCliId: 'codex',
         oncallChat: null,
         serialInput: false,
+        idleClose: { enabled: false, duration: 1, unit: 'days' },
+        replyMode: { override: null, default: 'chat-topic', effective: 'chat-topic', inherited: true },
         firstSeenAt: null,
         hasRole: false,
         hasMessageListener: false,
@@ -9408,6 +9560,9 @@ describe('GET /api/groups (Phase B)', () => {
         pinStreamingCardMasterEnabled: false,
         pinStreamingCardChatEnabled: true,
         pinStreamingCardEffectiveEnabled: false,
+        streamingCardMasterEnabled: true,
+        streamingCardChatEnabled: true,
+        streamingCardEffectiveEnabled: true,
       }]);
       spy.mockRestore();
     } finally {
@@ -9445,6 +9600,8 @@ describe('GET /api/groups (Phase B)', () => {
         agentCliId: 'codex',
         oncallChat: null,
         serialInput: false,
+        idleClose: { enabled: false, duration: 1, unit: 'days' },
+        replyMode: { override: null, default: 'chat-topic', effective: 'chat-topic', inherited: true },
         firstSeenAt: null,
         hasRole: false,
         hasMessageListener: false,
@@ -9452,6 +9609,9 @@ describe('GET /api/groups (Phase B)', () => {
         pinStreamingCardMasterEnabled: false,
         pinStreamingCardChatEnabled: false,
         pinStreamingCardEffectiveEnabled: false,
+        streamingCardMasterEnabled: true,
+        streamingCardChatEnabled: true,
+        streamingCardEffectiveEnabled: true,
       }]);
       spy.mockRestore();
     } finally {
@@ -9479,6 +9639,8 @@ describe('GET /api/groups (Phase B)', () => {
         name: 'config missing',
         oncallChat: null,
         serialInput: false,
+        idleClose: { enabled: false, duration: 1, unit: 'days' },
+        replyMode: { override: null, default: 'chat-topic', effective: 'chat-topic', inherited: true },
         firstSeenAt: null,
         hasRole: false,
         hasMessageListener: false,
@@ -9486,6 +9648,9 @@ describe('GET /api/groups (Phase B)', () => {
         pinStreamingCardMasterEnabled: false,
         pinStreamingCardChatEnabled: true,
         pinStreamingCardEffectiveEnabled: false,
+        streamingCardMasterEnabled: true,
+        streamingCardChatEnabled: true,
+        streamingCardEffectiveEnabled: true,
       }]);
     } finally {
       getBotSpy.mockRestore();
@@ -9526,6 +9691,8 @@ describe('GET /api/groups (Phase B)', () => {
           agentCliId: 'codex',
           oncallChat: null,
           serialInput: false,
+          idleClose: { enabled: false, duration: 1, unit: 'days' },
+          replyMode: { override: null, default: 'chat-topic', effective: 'chat-topic', inherited: true },
           firstSeenAt: null,
           hasRole: false,
           hasMessageListener: false,
@@ -9533,6 +9700,9 @@ describe('GET /api/groups (Phase B)', () => {
           pinStreamingCardMasterEnabled: true,
           pinStreamingCardChatEnabled: true,
           pinStreamingCardEffectiveEnabled: true,
+          streamingCardMasterEnabled: true,
+          streamingCardChatEnabled: true,
+          streamingCardEffectiveEnabled: true,
         },
         {
           chatId: 'oc_master_on_chat_off',
@@ -9540,6 +9710,8 @@ describe('GET /api/groups (Phase B)', () => {
           agentCliId: 'codex',
           oncallChat: null,
           serialInput: false,
+          idleClose: { enabled: false, duration: 1, unit: 'days' },
+          replyMode: { override: null, default: 'chat-topic', effective: 'chat-topic', inherited: true },
           firstSeenAt: null,
           hasRole: false,
           hasMessageListener: false,
@@ -9547,6 +9719,9 @@ describe('GET /api/groups (Phase B)', () => {
           pinStreamingCardMasterEnabled: true,
           pinStreamingCardChatEnabled: false,
           pinStreamingCardEffectiveEnabled: false,
+          streamingCardMasterEnabled: true,
+          streamingCardChatEnabled: true,
+          streamingCardEffectiveEnabled: true,
         },
         {
           chatId: 'oc_master_on_chat_on',
@@ -9554,6 +9729,8 @@ describe('GET /api/groups (Phase B)', () => {
           agentCliId: 'codex',
           oncallChat: null,
           serialInput: false,
+          idleClose: { enabled: false, duration: 1, unit: 'days' },
+          replyMode: { override: null, default: 'chat-topic', effective: 'chat-topic', inherited: true },
           firstSeenAt: null,
           hasRole: false,
           hasMessageListener: false,
@@ -9561,6 +9738,9 @@ describe('GET /api/groups (Phase B)', () => {
           pinStreamingCardMasterEnabled: true,
           pinStreamingCardChatEnabled: true,
           pinStreamingCardEffectiveEnabled: true,
+          streamingCardMasterEnabled: true,
+          streamingCardChatEnabled: true,
+          streamingCardEffectiveEnabled: true,
         },
       ]);
       spy.mockRestore();

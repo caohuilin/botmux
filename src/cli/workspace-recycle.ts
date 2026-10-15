@@ -15,6 +15,8 @@ exact targets while the directory exists. finish requires a successful generic
 reclamation event AND a missing old directory. A failed event closes nothing.
 The optional hook consumes botmux.workspace-recycle.v1 JSON from a generic
 lifecycle adapter; Botmux must be installed outside the reclaimed directory.
+A failed event (finish or hook) for an operation that was never prepared
+returns status not_prepared and closes nothing.
 JSON output; exit 0 = verified/prepared, 1 = partial/blocked, 2 = invalid input,
 3 = durable initiator handoff pending (poll status). No force/global-delete mode.`;
 

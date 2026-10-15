@@ -30,6 +30,8 @@ import {
   takeCodexAppControlLocatorEndpoint,
 } from './utils/codex-app-control.js';
 import { CODEX_APP_NO_PROGRESS_TIMEOUT_MS } from './utils/codex-app-turn-liveness.js';
+import { JsonRpcStdioCore } from './utils/jsonrpc-stdio.js';
+import { createRunnerTerminal } from './runner-common.js';
 import {
   TurnTokenUsageAccumulator,
   parseTokenUsagePair,
@@ -40,9 +42,11 @@ import {
   type DynamicToolCallParams,
 } from './services/codex-browser-broker.js';
 import type { CodexBrowserFamily } from './core/codex-browser-config.js';
+import type { CodexServiceTier } from './services/codex-service-tier.js';
 import { CodexAppCotCollector, prepareCodexAppCotMarker } from './services/codex-app-cot.js';
 
 import { bridgeCodexUserInput } from './services/codex-user-input.js';
+import { larkToolPromptFromEnv } from './core/lark-tool-binding.js';
 
 type JsonObject = Record<string, any>;
 
@@ -61,15 +65,9 @@ interface Args {
   locale?: string;
   model?: string;
   reasoningEffort?: string;
+  serviceTier?: CodexServiceTier;
   browserFamily?: CodexBrowserFamily;
   browserPluginRoot?: string;
-}
-
-interface PendingRequest {
-  resolve: (value: any) => void;
-  reject: (error: Error) => void;
-  method: string;
-  timer?: NodeJS.Timeout;
 }
 
 interface ActiveTurn {
@@ -173,6 +171,7 @@ interface QueuedInput {
 }
 
 const output = new RunnerControlWriter();
+const { writeLine, prompt } = createRunnerTerminal(output);
 const cotCollector = new CodexAppCotCollector();
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const RECONCILIATION_TIMEOUT_MS = 5_000;
@@ -270,6 +269,13 @@ function parseArgs(argv: string[]): Args {
     else if (key === '--locale' && val !== undefined) { out.locale = val; i++; }
     else if (key === '--model' && val !== undefined) { out.model = val; i++; }
     else if (key === '--reasoning-effort' && val !== undefined) { out.reasoningEffort = val; i++; }
+    else if (key === '--service-tier' && val !== undefined) {
+      if (val !== 'default' && val !== 'priority' && val !== 'ultrafast') {
+        throw new Error('--service-tier accepts default, priority, or ultrafast');
+      }
+      out.serviceTier = val;
+      i++;
+    }
     else if (key === '--browser-family' && (val === 'chrome' || val === 'edge')) { out.browserFamily = val; i++; }
     else if (key === '--browser-plugin-root' && val !== undefined) { out.browserPluginRoot = val; i++; }
   }
@@ -282,14 +288,6 @@ function parseArgs(argv: string[]): Args {
   out.controlSocketPath = control.socketPath;
   out.controlLocatorPath = control.locatorPath;
   return out;
-}
-
-function writeLine(text = ''): void {
-  output.line(text);
-}
-
-function prompt(): void {
-  output.display('› ');
 }
 
 function appDeveloperInstructions(args: Args): string {
@@ -310,6 +308,7 @@ function appDeveloperInstructions(args: Args): string {
       args.browserFamily
         ? '当 `botmux_browser` 工具存在时，Chrome/Edge 操作必须使用该工具；不要寻找或回退到 `node_repl`、Playwright 服务或其它浏览器控制面。'
         : '',
+      larkToolPromptFromEnv('zh'),
       identity ? `<identity>\n${identity}\n</identity>` : '',
     ].filter(Boolean).join('\n\n');
   }
@@ -323,15 +322,25 @@ function appDeveloperInstructions(args: Args): string {
     args.browserFamily
       ? 'When the `botmux_browser` tool is present, use it for Chrome/Edge operations. Do not look for or fall back to node_repl, standalone Playwright, or another browser-control surface.'
       : '',
+    larkToolPromptFromEnv('en'),
     identity ? `<identity>\n${identity}\n</identity>` : '',
   ].filter(Boolean).join('\n\n');
 }
 
 class AppServerClient {
   private child: ChildProcessWithoutNullStreams;
-  private nextId = 1;
-  private stdoutBuffer = '';
-  private pending = new Map<number, PendingRequest>();
+  /** NDJSON framing + pending table. 'microtask' dispatch keeps a response's
+   *  awaiting continuation ahead of a notification coalesced behind it. */
+  private readonly rpc = new JsonRpcStdioCore({
+    dispatch: 'microtask',
+    mapRpcError: (method, error) => new AppServerRpcError(
+      method,
+      typeof error.code === 'number' ? error.code : undefined,
+      error.data,
+      typeof error.message === 'string' ? error.message : JSON.stringify(error),
+    ),
+    onMessage: msg => this.dispatch(msg),
+  });
   private notificationHandlers: Array<(msg: JsonObject) => void> = [];
   private requestHandlers: Array<(msg: JsonObject) => boolean> = [];
   private lastStderr = '';
@@ -343,14 +352,14 @@ class AppServerClient {
     return this.child.exitCode !== null || this.child.signalCode !== null;
   }
 
-  constructor(private readonly codexBin: string, private readonly cwd: string) {
+  constructor(codexBin: string, cwd: string) {
     this.child = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
       cwd,
       env: process.env,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
-    this.child.stdout.on('data', chunk => this.onStdout(chunk.toString('utf8')));
+    this.child.stdout.on('data', chunk => this.rpc.push(chunk.toString('utf8')));
     this.child.stdin.on('error', err => this.failAll(new Error(`Codex app-server stdin error: ${err.message}`)));
     this.child.stderr.on('data', chunk => {
       const text = chunk.toString('utf8');
@@ -392,30 +401,22 @@ class AppServerClient {
     params: unknown,
     options: { timeoutMs?: number } = {},
   ): Promise<any> {
-    const id = this.nextId++;
-    return new Promise((resolve, reject) => {
-      const timeoutMs = options.timeoutMs;
-      const pending: PendingRequest = { resolve, reject, method };
-      if (timeoutMs !== undefined) {
-        if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-          reject(new AppServerRequestTimeoutError(method, Math.max(0, timeoutMs)));
-          return;
-        }
-        pending.timer = setTimeout(() => {
-          if (!this.pending.delete(id)) return;
-          reject(new AppServerRequestTimeoutError(method, timeoutMs));
-        }, timeoutMs);
-        pending.timer.unref?.();
-      }
-      this.pending.set(id, pending);
-      try {
-        this.write({ jsonrpc: '2.0', id, method, params });
-      } catch (err) {
-        this.pending.delete(id);
-        if (pending.timer) clearTimeout(pending.timer);
-        reject(asError(err));
-      }
+    const id = this.rpc.nextId();
+    const { timeoutMs } = options;
+    if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
+      return Promise.reject(new AppServerRequestTimeoutError(method, Math.max(0, timeoutMs)));
+    }
+    const response = this.rpc.track(id, method, {
+      timeoutMs,
+      onTimeout: (m, ms) => new AppServerRequestTimeoutError(m, ms),
+      unrefTimer: true,
     });
+    try {
+      this.write({ jsonrpc: '2.0', id, method, params });
+    } catch (err) {
+      this.rpc.abort(id, asError(err));
+    }
+    return response;
   }
 
   respond(id: number | string, result: unknown): void {
@@ -445,74 +446,11 @@ class AppServerClient {
   private failAll(err: Error): void {
     this.lifetime.abort();
     this.fatalError = this.fatalError ?? err;
-    const fatal = this.fatalError;
-    for (const pending of this.pending.values()) {
-      if (pending.timer) clearTimeout(pending.timer);
-      pending.reject(fatal);
-    }
-    this.pending.clear();
+    this.rpc.failAll(this.fatalError);
   }
 
-  /**
-   * Message ordering must not depend on pipe chunk boundaries. Dispatching
-   * line N+1 synchronously after line N starves the microtask continuations
-   * line N scheduled: a response resolving `await request(...)` runs its
-   * awaiting caller (which records protocol state, e.g. "steer accepted,
-   * group grew") only AFTER the whole synchronous loop — so a notification
-   * coalesced into the same chunk behind its own request's response was
-   * processed against stale state and the turn stalled forever. The kernel
-   * coalesces adjacent writes whenever this reader is scheduled late (routine
-   * on loaded CI runners, possible anywhere), so yield a MICROtask between
-   * lines: already-queued continuations run before the next dispatch, while
-   * anything the runner deliberately defers past the current burst (e.g.
-   * macrotask-deferred publications) still sees the burst as one unit.
-   */
-  private stdoutDraining = false;
-
-  private onStdout(data: string): void {
-    this.stdoutBuffer += data;
-    if (this.stdoutDraining) return;
-    this.stdoutDraining = true;
-    const step = (): void => {
-      const nl = this.stdoutBuffer.indexOf('\n');
-      if (nl < 0) {
-        this.stdoutDraining = false;
-        return;
-      }
-      const line = this.stdoutBuffer.slice(0, nl).trim();
-      this.stdoutBuffer = this.stdoutBuffer.slice(nl + 1);
-      if (line) {
-        let msg: JsonObject | undefined;
-        try {
-          msg = JSON.parse(line);
-        } catch {
-          msg = undefined;
-        }
-        if (msg) this.dispatch(msg);
-      }
-      queueMicrotask(step);
-    };
-    step();
-  }
-
+  /** Server requests and notifications; responses are settled by the RPC core. */
   private dispatch(msg: JsonObject): void {
-    if (typeof msg.id === 'number' && (msg.result !== undefined || msg.error !== undefined)) {
-      const pending = this.pending.get(msg.id);
-      if (!pending) return;
-      this.pending.delete(msg.id);
-      if (pending.timer) clearTimeout(pending.timer);
-      if (msg.error) {
-        pending.reject(new AppServerRpcError(
-          pending.method,
-          typeof msg.error.code === 'number' ? msg.error.code : undefined,
-          msg.error.data,
-          typeof msg.error.message === 'string' ? msg.error.message : JSON.stringify(msg.error),
-        ));
-      }
-      else pending.resolve(msg.result);
-      return;
-    }
-
     if ((typeof msg.id === 'number' || typeof msg.id === 'string') && typeof msg.method === 'string') {
       for (const handler of this.requestHandlers) {
         if (handler(msg)) return;
@@ -785,6 +723,8 @@ let activeTurnEpoch = 0;
  * is incorrectly sent with turn/start and its completion can be discarded as
  * belonging to an "unexpected" native turn. */
 let nativeActiveTurnId: string | undefined;
+let currentModel: string | undefined;
+let effortUpdateTail: Promise<void> = Promise.resolve();
 const queue: QueuedInput[] = [];
 let inputBuffer = '';
 let processing = false;
@@ -1244,6 +1184,10 @@ async function reconcileCompletedTurn(
 function handleNotification(msg: JsonObject, replayedAfterResponse = false): void {
   const params = msg.params ?? {};
   if (params.threadId !== threadId) return;
+  if (msg.method === 'thread/settings/updated') {
+    if (typeof params.threadSettings?.model === 'string') currentModel = params.threadSettings.model;
+    return;
+  }
   const notificationTurnId = params.turnId ?? params.turn?.id;
 
   // Per-turn token usage rides on thread/tokenUsage/updated (NOT turn/completed).
@@ -1616,6 +1560,7 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
         // Keep Codex App's rich history in sync with turns created by this
         // external runner so the desktop UI can render follow-up messages.
         persistExtendedHistory: true,
+        ...(args.serviceTier ? { serviceTier: args.serviceTier } : {}),
         ...(browserBroker ? { dynamicTools: [CODEX_BROWSER_DYNAMIC_TOOL] } : {}),
       }, { timeoutMs: startupRequestTimeout(startupDeadlineAtMs, 'thread/resume') });
       const resumedThreadId = String(resumed.thread.id);
@@ -1623,6 +1568,7 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
         throw new Error(`Strict resume expected thread ${threadId}, received ${resumedThreadId}`);
       }
       threadId = resumedThreadId;
+      currentModel = resumed.model;
       threadReady = true;
       emitMarker('thread', { threadId: resumedThreadId });
       return resumedThreadId;
@@ -1654,6 +1600,7 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
     // fresh thread/start, so a fold-in (existing thread) keeps its frozen model —
     // matching the API's fresh-spawn-only override semantics.
     ...(args.model && args.model.trim() ? { model: args.model.trim() } : {}),
+    ...(args.serviceTier ? { serviceTier: args.serviceTier } : {}),
     serviceName: 'botmux',
     developerInstructions: appDeveloperInstructions(args),
     ephemeral: false,
@@ -1665,6 +1612,7 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
   }, { timeoutMs: startupRequestTimeout(startupDeadlineAtMs, 'thread/start') });
   const startedThreadId = String(started.thread.id);
   threadId = startedThreadId;
+  currentModel = started.model;
   threadReady = true;
   emitMarker('thread', { threadId: startedThreadId });
   void client.request('thread/name/set', {
@@ -2485,6 +2433,64 @@ async function drainQueue(): Promise<void> {
   }
 }
 
+async function updateReasoningEffort(
+  requestId: string, effort: string, tid: string | undefined, targetTurnId: string | undefined, deadline: number,
+): Promise<void> {
+  const current = client;
+  const modelId = currentModel;
+  let saved = false;
+  try {
+    if (!runnerReady || !threadReady || !tid || tid !== threadId || !modelId
+      || generationFenced || current.hasExited || Date.now() >= deadline) {
+      emitMarker('effort_result', { requestId, status: 'unavailable' });
+      return;
+    }
+    let cursor: string | undefined;
+    let model: JsonObject | undefined;
+    do {
+      const page = await current.request('model/list', { limit: 100, includeHidden: true, ...(cursor ? { cursor } : {}) }, {
+        timeoutMs: Math.min(10_000, deadline - Date.now()),
+      });
+      model = page.data?.find((entry: JsonObject) => entry.model === modelId || entry.id === modelId);
+      cursor = page.nextCursor ?? undefined;
+    } while (!model && cursor);
+    if (!model) throw new Error('current model not advertised');
+    const choices = model.supportedReasoningEfforts?.map((entry: JsonObject) => entry.reasoningEffort) ?? [];
+    if (!choices.includes(effort)) {
+      emitMarker('effort_result', { requestId, status: 'invalid', choices });
+      return;
+    }
+    if (client !== current || threadId !== tid || currentModel !== modelId || generationFenced) throw new Error('runner changed');
+    await current.request('thread/settings/update', { threadId: tid, effort }, {
+      timeoutMs: Math.min(10_000, deadline - Date.now()),
+    });
+    saved = true;
+    let status = 'future_only';
+    let reason: import('./types.js').CodexAppEffortResult['reason'];
+    // Capture the native id on command arrival. Never retarget a later turn
+    // when the original completes while model/list or settings/update waits.
+    if (targetTurnId) {
+      const result = await current.request('turn/settings/update', { threadId: tid, turnId: targetTurnId, effort }, {
+        timeoutMs: Math.min(10_000, deadline - Date.now()),
+      });
+      if (result.status === 'applied') status = 'applied';
+      else if (result.status === 'targetUnavailable') reason = 'target_unavailable';
+      else throw new Error('unknown settings status');
+    }
+    emitMarker('effort_result', { requestId, status, ...(reason ? { reason } : {}) });
+  } catch (error) {
+    // Only the specific turn-settings gate proves the feature is disabled.
+    const featureDisabled = saved && error instanceof AppServerRpcError
+      && error.method === 'turn/settings/update' && error.code === -32600
+      && error.message.includes('turn settings updates require the step_model_switching feature');
+    // An ambiguous settings response never cancels/replays the business turn.
+    emitMarker('effort_result', {
+      requestId, status: saved ? 'future_only' : 'error',
+      ...(featureDisabled ? { reason: 'step_model_switching_disabled' } : {}),
+    });
+  }
+}
+
 function enqueueLine(line: string): void {
   const trimmed = line.trim();
   if (!trimmed) return;
@@ -2492,6 +2498,15 @@ function enqueueLine(line: string): void {
     const encoded = trimmed.slice('::botmux-codex-app:'.length);
     try {
       const decoded = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
+      if (decoded?.type === 'effort' && typeof decoded.requestId === 'string'
+        && decoded.requestId.length > 0 && decoded.requestId.length <= 128
+        && typeof decoded.effort === 'string' && /^(low|medium|high|xhigh|max|ultra)$/.test(decoded.effort)) {
+        const targetTurnId = activeTurn?.nativeTurnId ?? nativeActiveTurnId;
+        const targetThreadId = threadId;
+        const deadline = Date.now() + 30_000;
+        effortUpdateTail = effortUpdateTail.then(() => updateReasoningEffort(decoded.requestId, decoded.effort, targetThreadId, targetTurnId, deadline));
+        return;
+      }
       if (decoded?.type === 'message' && typeof decoded.content === 'string') {
         const codexAppInput = isCodexAppTurnInput(decoded.codexAppInput)
           ? decoded.codexAppInput

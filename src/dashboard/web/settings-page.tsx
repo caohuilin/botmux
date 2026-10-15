@@ -1,11 +1,17 @@
 import type React from 'react';
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { DropdownMenu, FieldTitle, LoadingState, dropdownLabel } from './dashboard-components.js';
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
+import { DropdownMenu, FieldTitle, LoadingState, ToggleRow as BaseToggleRow, dropdownLabel } from './dashboard-components.js';
 import { VcConsumerProfilesGate } from './vc-consumer-profiles-section.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { store } from './store.js';
-import { updateResponseNeedsRestart } from './update-action.js';
+import {
+  updateResponseNeedsRestart,
+  pollUpdateStatus,
+  classifyOtherUpdate,
+  observedInstallCompleted,
+  binaryProgressText,
+} from './update-action.js';
 import { ui } from './ui.js';
 import { confirm } from './confirm-modal.js';
 import { toast } from './toast.js';
@@ -91,6 +97,8 @@ interface DashboardSettings {
   remoteAccess: boolean;
   /** OAuth 回跳基址；'' = 未配置（退回 127.0.0.1 粘贴流程）。 */
   oauthRedirectBase: string;
+  /** GitHub Release 下载代理（二进制自更新）；'' = 未配置（读 HTTPS_PROXY / HTTP_PROXY）。 */
+  httpProxy: string;
   scheduleTimeZone: string;
   hostTimeZone: string;
   effectiveScheduleTimeZone: string;
@@ -256,6 +264,7 @@ function parseSettings(s: any): DashboardSettings {
     multiTopic: { enabled: s?.multiTopic?.enabled !== false },
     remoteAccess: s?.remoteAccess === true,
     oauthRedirectBase: typeof s?.oauthRedirectBase === 'string' ? s.oauthRedirectBase : '',
+    httpProxy: typeof s?.httpProxy === 'string' ? s.httpProxy : '',
     scheduleTimeZone: typeof s?.scheduleTimeZone === 'string' ? s.scheduleTimeZone : '',
     hostTimeZone: typeof s?.hostTimeZone === 'string' && s.hostTimeZone ? s.hostTimeZone : 'UTC',
     effectiveScheduleTimeZone:
@@ -285,6 +294,7 @@ function SettingsPage() {
   const tr = useT();
   const mountedRef = useRef(false);
   const timersRef = useRef<Set<number>>(new Set());
+  const updatePollStopRef = useRef<(() => void) | null>(null);
   const [settings, setSettings] = useState<DashboardSettings | null>(null);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -391,6 +401,8 @@ function SettingsPage() {
     return () => {
       mountedRef.current = false;
       clearTimers();
+      updatePollStopRef.current?.();
+      updatePollStopRef.current = null;
     };
   }, [clearTimers, loadSettings]);
 
@@ -605,11 +617,58 @@ function SettingsPage() {
     if (!await confirm({ title: tr('update.confirmUpdateTitle'), message: confirmMsg, confirmLabel: tr('update.btnRunUpdate'), cancelLabel: tr('update.btnCancel') })) return;
     setUpBusy(true);
     setUpMsg({ text: localDev ? tr('update.updatingLocalDev') : tr('update.updating', { command: s.updateCommand! }) });
+    const stopUpdatePoll = (): void => {
+      updatePollStopRef.current?.();
+      updatePollStopRef.current = null;
+    };
+    // Standalone-binary updates download a ~174MB asset; surface measured byte
+    // progress from /api/update/status while the long POST is in flight.
+    updatePollStopRef.current = pollUpdateStatus(fetch, snap => {
+      if (mountedRef.current && snap.binaryUpdate) {
+        setUpMsg({ text: binaryProgressText(snap.binaryUpdate, tr) });
+      }
+    }, 1000);
     try {
       const r = await fetch('/api/update/run', { method: 'POST' });
       const body = await r.json().catch(() => ({}));
-      if (!mountedRef.current) return;
+      if (!mountedRef.current) { stopUpdatePoll(); return; }
       if (!r.ok || body.ok === false) {
+        // Another update (another dashboard tab, the CLI, or scheduled
+        // maintenance) owns the shared install lock. Track it via status rather
+        // than reporting a failure: the cross-process flag is invisible, so
+        // install completion is decided from version state. "Installed" does NOT
+        // reload the page — the winner may be sitting on its own restart
+        // confirmation, and a CLI update never restarts; surface the pending
+        // restart and let the existing restart flow apply it.
+        if (body?.error === 'update_in_flight') {
+          const startVersion = String(s.current);
+          stopUpdatePoll();
+          updatePollStopRef.current = pollUpdateStatus(fetch, snap => {
+            if (!mountedRef.current) return;
+            const kind = classifyOtherUpdate(snap);
+            if (observedInstallCompleted(snap, startVersion, false)) {
+              stopUpdatePoll();
+              setUpBusy(false);
+              setUpMsg({ text: tr('update.noRestartHint'), cls: 'hint-ok' });
+              void fetchStatus();
+              return;
+            }
+            if (kind === 'progress' && snap.binaryUpdate) {
+              setUpMsg({ text: binaryProgressText(snap.binaryUpdate, tr) });
+            } else {
+              setUpMsg({ text: tr(kind === 'busy' ? 'update.inProgressBusy' : 'update.inProgressExternal') });
+            }
+          }, 1000, 10 * 60_000, () => {
+            // Independent of status responses: persistent 503s, a dead
+            // network, or a hung request must still reach this terminal state.
+            if (!mountedRef.current) return;
+            updatePollStopRef.current = null;
+            setUpBusy(false);
+            setUpMsg({ text: tr('update.inProgressSlow'), cls: 'hint-warn-inline' });
+          });
+          return;
+        }
+        stopUpdatePoll();
         // Dirty worktree fails closed — surface the file list so the user can act.
         if (body?.error === 'dirty_worktree') {
           setUpBusy(false);
@@ -621,6 +680,7 @@ function SettingsPage() {
         setUpMsg({ text: tr('update.updateFailed', { detail }), cls: 'hint-warn-inline' });
         return;
       }
+      stopUpdatePoll();
       // A restart is needed when the server says so (local-dev build always
       // regenerates dist/, even when HEAD didn't move) or when the version
       // changed (generic npm/pnpm/bun path, which sets no restartRequired).
@@ -646,6 +706,7 @@ function SettingsPage() {
         await fetchStatus();
       }
     } catch (e) {
+      stopUpdatePoll();
       if (!mountedRef.current) return;
       setUpBusy(false);
       setUpMsg({ text: tr('update.updateFailed', { detail: e instanceof Error ? e.message : String(e) }), cls: 'hint-warn-inline' });
@@ -1132,6 +1193,15 @@ function SettingsBody(props: {
               />
             </div>
           </div>
+          <HttpProxyRow
+            value={settings.httpProxy}
+            disabled={!canWrite || savingKey === 'httpProxy'}
+            onSave={value => props.onSave(
+              'httpProxy',
+              { httpProxy: value },
+              st => ({ ...st, httpProxy: value }),
+            )}
+          />
         </SettingsBlock>
         <div id="settings-update">{props.updateBlock}</div>
       </SettingsGroup>
@@ -1556,27 +1626,9 @@ export function TimeZoneRow(props: {
   );
 }
 
-function ToggleRow(props: {
-  title: string;
-  help: string;
-  checked: boolean;
-  disabled: boolean;
-  onChange(value: boolean): void;
-}) {
-  return (
-    <label className="toggle-row">
-      <input
-        type="checkbox"
-        checked={props.checked}
-        disabled={props.disabled}
-        onChange={e => props.onChange(e.currentTarget.checked)}
-      />
-      <span className="switch" aria-hidden="true" />
-      <span className="toggle-tx">
-        <strong><FieldTitle className="settings-toggle-title" help={props.help}>{props.title}</FieldTitle></strong>
-      </span>
-    </label>
-  );
+/** settings 页的开关行：共享 ToggleRow + 本页的标题样式钩子。 */
+function ToggleRow(props: Omit<ComponentProps<typeof BaseToggleRow>, 'TitleComponent' | 'titleClassName'>) {
+  return <BaseToggleRow {...props} titleClassName="settings-toggle-title" />;
 }
 
 const GROUP_NAME_PREFIX_INPUT_MAX_LENGTH = 32;
@@ -1718,6 +1770,75 @@ export function currentBrowserOrigin(): string {
 
 /** 与服务端 `normalizeOAuthRedirectBase` 同一套判定（http(s) origin，不带路径/
  *  query/fragment），只是提前到前端，避免用户点了保存才吃一个 error code。 */
+/** Mirrors the server's normalizeHttpProxy: `http://[user:pass@]host[:port]`,
+ *  no path / query (the download tunnel dials the proxy over plain HTTP). */
+export function isValidHttpProxy(raw: string): boolean {
+  const value = raw.trim().replace(/\/+$/, '');
+  if (!/^http:\/\//i.test(value)) return false;
+  try {
+    const url = new URL(value);
+    return !!url.hostname && url.pathname === '/' && !url.search && !url.hash;
+  } catch {
+    return false;
+  }
+}
+
+/** Proxy for downloading new botmux binaries from GitHub Releases. */
+export function HttpProxyRow(props: {
+  value: string;
+  disabled: boolean;
+  onSave(value: string): Promise<void> | void;
+}) {
+  const tr = useT();
+  const [draft, setDraft] = useState(props.value);
+  useEffect(() => setDraft(props.value), [props.value]);
+
+  const trimmed = draft.trim().replace(/\/+$/, '');
+  // 空串合法（= 清除配置，退回环境变量）。
+  const valid = trimmed === '' || isValidHttpProxy(trimmed);
+  const dirty = trimmed !== props.value.trim().replace(/\/+$/, '');
+  const submit = () => {
+    if (props.disabled || !dirty || !valid) return;
+    void props.onSave(trimmed);
+  };
+
+  return (
+    <div className="settings-subfield settings-http-proxy-editor">
+      <div className="settings-field-row">
+        <FieldTitle help={tr('settings.httpProxyHelp')}>{tr('settings.httpProxy')}</FieldTitle>
+        <input
+          className="settings-text-input"
+          type="text"
+          data-input="httpProxy"
+          value={draft}
+          placeholder={tr('settings.httpProxyPlaceholder')}
+          disabled={props.disabled}
+          autoComplete="off"
+          spellCheck={false}
+          onChange={event => setDraft(event.currentTarget.value)}
+          onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); submit(); } }}
+        />
+      </div>
+      <p className="settings-subfield-hint" data-http-proxy-hint>
+        {trimmed === ''
+          ? tr('settings.httpProxyUnset')
+          : valid ? tr('settings.httpProxyActive') : tr('settings.httpProxyInvalid')}
+      </p>
+      <div className="actions">
+        <button
+          type="button"
+          className="page-primary-action"
+          data-action="http-proxy-save"
+          disabled={props.disabled || !dirty || !valid}
+          onClick={submit}
+        >
+          {tr('settings.httpProxySave')}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function isValidOAuthRedirectBase(raw: string): boolean {
   const value = raw.trim();
   if (!/^https?:\/\//i.test(value)) return false;

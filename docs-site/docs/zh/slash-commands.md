@@ -14,9 +14,11 @@
 | `/lane status` | 查看本人的独立 principal lane，包括分支、worktree、脏状态和未推送提交数（复用现有 bot 级 XPI 开关启用 principal lane 时可用） |
 | `/lane close` | 安全关闭本人的独立 principal lane：有运行中/排队任务或未提交文件时拒绝，回收前先推送未发布提交，且不会自动合并或删除分支 |
 | `/retry` | 重试最近一个失败或被中断的 turn（10s 冷却） |
+| `/queue <消息>` | Codex App 活会话：将文字消息作为独立一轮排队，等当前任务结束后执行；空闲时直接开始。支持多行纯文本，暂不支持富文本和附件；需命令操作权限（可通过 canTalkDaemonCommands 授权）。无会话、尚未就绪或其它 CLI 会明确拒绝 开启 trigger-user 按人凭证时会在接纳前刷新本轮身份；但后续消息可覆盖单槽凭证，等待轮的 bytedcli/lark-cli 仍可能被 turn-mismatch 拒绝，需要重试。 |
 | `/stop` | 中断当前 turn，保留会话；等价于流式卡片里的「停止」按钮 |
 | `/restart` | 重启 CLI 进程（保留 session 上下文） |
-| `/close` | 关闭会话并发送可恢复卡片（含 CLI 自身 resume 命令） |
+| `/close` | 关闭会话并发送可恢复卡片（含 CLI 自身 resume 命令）。关闭后再发消息会开新会话 |
+| `/resume [会话id]` | 本话题/本群**没有会话**时恢复已关闭的会话：不带参数恢复这里最近关闭的一个；带别处的会话 id 时像 `/fork` 一样复制到这里继续（继承完整上下文，原会话不动；仅支持可 fork 的 CLI；Codex / TraeX 的已关闭会话无法确认启动形态，需到原处恢复）。**有会话时**原样交给 CLI 自带的 `/resume`。有对话权限即可使用；跨位置复制凭会话 id（只在原聊天可见、不可猜），信任级别同 `/fork` |
 | `/dismiss` | 专属会话群顶层专用：二次确认后关闭会话并解散整个群（仅建群者本人且具备操作权限；代码与 worktree 保留；私聊、普通群、子话题、adopt 会话不支持）。只想关闭会话、保留群聊请用 `/close` |
 | `/cleanup-wt <ID>` | worktree 最终删除失败后重试已持久化的清理任务；删除前会重新校验权限、活动会话、worktree 身份和安全状态 |
 | `/fork <任务>` | 继承当前会话的完整上下文，在同一话题群新建并行子话题；源会话原样继续（Claude 系 / Codex 或 TraeX 终端模式） |
@@ -95,7 +97,7 @@ Botmux 管理的 Codex 飞书会话遇到明确的模型容量错误（`server_o
 | `/reply-mode` `/reply-mode status` | 查看当前私聊会话模式 |
 | `/reply-mode chat` | 每个 1:1 私聊内部扁平连续会话，同一 DM 的消息共用一个会话（**默认**） |
 | `/reply-mode topic` `/reply-mode new-topic` | 每条**顶层** DM 开独立会话/线程；同一已有 thread 内的回复继续该 thread 会话 |
-| `/reply-mode group` | 每条**顶层** DM 自动创建一个「你+bot」专属会话群并把会话落在群里（AI 自动命名、回群续聊自动恢复上下文；详见私聊会话模式 `p2pMode=group`） |
+| `/reply-mode group` | 每条**顶层** DM 自动创建一个「你+bot」专属会话群并把会话落在群里（AI 自动命名；会话关闭后回群再说话会开新会话，要接着聊点关闭卡「恢复会话」或发 `/resume`；详见私聊会话模式 `p2pMode=group`） |
 
 `shared` / `chat-topic` 依赖群内原生话题，私聊不支持，会被拒绝。
 
@@ -103,13 +105,14 @@ Botmux 管理的 Codex 飞书会话遇到明确的模型容量错误（`server_o
 
 | 命令 | 说明 |
 |------|------|
-| `/reply-mode` `/reply-mode status` | 查看当前群回复模式 |
+| `/reply-mode` `/reply-mode status` | 查看当前群回复模式，并标明来源（继承 Bot 默认 / 本群覆盖） |
+| `/reply-mode inherit` | 清除本群覆盖，恢复跟随 Bot 默认（别名 `default` / `reset` / `clear`） |
 | `/reply-mode chat` | 整群连续会话（顶层 @ 都进同一个会话） |
 | `/reply-mode chat-topic` | 顶层连续、原生话题各自独立会话 |
 | `/reply-mode new-topic` | 每次 @ 新建话题与独立会话 |
 | `/reply-mode topic` `/reply-mode shared` | 话题展示但共享同一会话（`topic` 是 `shared` 的兼容别名） |
 
-群级设置会覆盖 dashboard「Bot 配置 → 普通群模式」的默认值。
+群级设置会覆盖 dashboard「Bot 配置 → 普通群模式」的默认值；显式设置即使与当前默认相同也会保留为覆盖（之后改 Bot 默认不影响本群），要重新跟随默认请用 `/reply-mode inherit`。也可以在 dashboard「群组 → 管理」里按机器人逐个选择。设置新模式需要确认当前是普通群；查看与清除覆盖不受此限制。
 
 `/substitute [status|on|off]` —— 查看或切换当前群的**替身模式**开关（修改需 owner）。
 
@@ -141,9 +144,24 @@ botmux tabs add "https://example.com/project/releases/2026" \
 
 CLI 会从当前 `BOTMUX_SESSION_ID` 自动确定 bot 和群；脱离当前会话时可传 `--session-id`，要覆盖目标群可传 `--chat-id`。`add` 按 URL 幂等：同一个页面已有 Tab 时复用，并按需更新名称，适用于 MR、项目看板、发布页等自动化场景。后台还可使用 `botmux tabs list|update|remove|sort`。
 
+## Codex App 会话内调整推理强度
+
+已有 Codex App 会话可发送 `/effort low|medium|high|xhigh|max|ultra`，档位按当前模型通告的信息校验。命令保存后续轮次的设置，不会追加模型消息或中断任务。
+
+**更新正在运行的当前轮需要显式启用 Codex 实验特性 `step_model_switching`。** 在已核对的 Codex 0.160 / 0.162.1 中，该特性为 UnderDevelopment，默认关闭，Botmux 不自动开启。希望启用时，在该会话 app-server 实际使用的 `CODEX_HOME/config.toml` 中合并以下配置，并在 app-server 下次启动后使用（已有 `[features]` 表时只添加或修改对应键）：
+
+```toml
+[features]
+step_model_switching = true
+```
+
+未开启时，运行中发送命令仍可保存后续轮次设置，并明确提示当前轮因未开特性而未更新；目标轮次已经结束或不可用时会给出不同提示。只有原生接口返回 `applied` 才确认服务端接受当前轮更新；已经发出的模型请求保持原参数，当前轮也可能没有后续推理步骤。
+
+普通 Codex CLI、Claude Code 等其它 CLI 的 `/effort` 仍按下面的透传规则处理。
+
 ## 🔀 透传给底层 CLI
 
-`/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` `/fast` —— 字面送达底层 CLI，交给它的内置命令处理。
+`/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` `/fast` —— 字面送达底层 CLI，交给它的内置命令处理（Codex App 的 `/effort` 例外，见上文）。
 
 `/fast` 仅对 Codex 生效：切换 Codex 原生的 service tier 档位，流式卡片会显示只读的 `⚡ <档位>` 徽标，如实反映 Codex 实际运行的档位。在 RPC 输入模式或 Riff 后端上，按键到不了 Codex 执行器，因此 `/fast` 在这些后端会 fail-closed 给出明确提示，而非静默失效。
 

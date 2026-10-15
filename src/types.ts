@@ -13,7 +13,7 @@ import type {
 } from './adapters/backend/remote-runner-protocol.js';
 import type { CliUsageLimitState } from './utils/cli-usage-limit.js';
 import type { VcMeetingActivityType } from './vc-agent/types.js';
-import type { CodexServiceTierSnapshot } from './services/codex-service-tier.js';
+import type { CodexServiceTier, CodexServiceTierPreference, CodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import type { CliId } from './adapters/cli/types.js';
 import type { CliRuntimeSnapshot } from './adapters/cli/runtime.js';
 import type { CliLaunchMode } from './core/cli-launch-mode.js';
@@ -450,6 +450,25 @@ export interface MessageProvenance {
 
 export interface Session {
   sessionId: string;
+  /** Internal target-side owner for an idempotent dispatch-launch session. */
+  dispatchLaunchId?: string;
+  /** Immutable model/effort selected by the public topic dispatch seam. */
+  dispatchLaunchSpec?: {
+    version: 1;
+    targetLarkAppId: string;
+    chatId: string;
+    rootMessageId: string;
+    requested: { model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' };
+    effective: { model: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' };
+    createdAt: string;
+    expiresAt: string;
+    effectiveRuntime?: {
+      model: string;
+      reasoningEffort?: string;
+      workerGeneration: number;
+      observedAt: string;
+    };
+  };
   /** Build fingerprint of the last fresh owned Codex App runner that became ready. */
   runnerBuildId?: string;
   chatId: string;
@@ -874,7 +893,7 @@ export interface Session {
    * 落点）。botmux send 用 `BOTMUX_TURN_ID` 取自己那轮的 target；turn 结束后由
    * deliverFinalOutput / botmux send 成功路径清理对应 entry。
    */
-  docCommentTargets?: Record<string, { fileToken: string; fileType: string; commentId: string; replyToName?: string; replyToOpenId?: string; turnId: string; replyId?: string; reactionId?: string }>;
+  docCommentTargets?: Record<string, { fileToken: string; fileType: string; commentId: string; replyToName?: string; replyToOpenId?: string; turnId: string; replyId?: string; reactionId?: string; reactionType?: string; reactionIdentity?: 'tenant' | 'user' }>;
   /** Latest quote-target sender. Kept for UI/legacy compatibility; turn-bound
    * `replyTargets[turnId].senderOpenId` is authoritative for --mention-back. */
   quoteTargetSenderOpenId?: string;
@@ -1009,6 +1028,8 @@ export interface Session {
   /** Optional reasoning effort frozen at creation (per-turn API override).
    *  Meaningful for codex/codex-app/traex/grok; injected by adapters at spawn. */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  /** Codex service tier frozen at session creation; legacy missing means inherit. */
+  serviceTier?: CodexServiceTierPreference;
   /** Optional TraeX backend variant frozen when this session first launches.
    * Missing preserves the historical inherit-from-TraeX-global behavior. */
   modelBackendVariant?: 'standard' | 'max';
@@ -1130,6 +1151,16 @@ export interface Session {
   /** Network access decision recorded alongside `sandbox` at session creation. */
   sandboxNetwork?: boolean;
   sandboxNetworkPolicy?: import('./core/sandbox-network-policy.js').SandboxNetworkPolicy;
+  /**
+   * Set when the auto-worktree gate let this session DEGRADE to the real
+   * default dir (worktree creation failed and the gate judged that no local
+   * oncall sandbox would apply). The worker refuses to start an oncall sandbox
+   * whose workingDir is this dir: the gate's verdict may only be STRENGTHENED
+   * at fork, never weakened — e.g. a mojo session proven fully remote at gate
+   * time but resolved local at fork (config edited mid-build) must not engage
+   * the read-write-bound oncall sandbox on the real project.
+   */
+  autoWorktreeFallbackDir?: string;
   /** Persisted adopt metadata — allows adopt sessions to survive daemon restarts.
    *  Either tmuxTarget (tmux backend) OR zellijSession+zellijPaneId (zellij). */
   adoptedFrom?: {
@@ -1195,10 +1226,6 @@ export interface CrossPrincipalInterruption {
    *  value as a tripwire and quarantines the session, so nothing may write it.
    *  Bot proposers now classify before send and do not write this field. */
   classificationDeadlineAt?: number;
-  /** Legacy deadline from builds that published bot classification notices.
-   * Current builds require `botmux send --as …` before send and terminalise an
-   * unclassified legacy record without emitting another bot-directed message. */
-  botClassifyDeadlineAt?: number;
   /** Separate bound for waiting until the active owner turn finishes. This is
    *  not the owner's confirmation timeout. */
   ownerWaitDeadlineAt?: number;
@@ -1375,6 +1402,9 @@ export interface LarkMessage {
    *  without a session (e.g. `/group`) so the handler can reach the chat
    *  roster without an active session to read `ds.chatId` from. */
   chatId?: string;
+  /** Source chat type, alongside `chatId` for session-less commands
+   *  (`/resume` copying a session into this chat needs it). */
+  chatType?: 'group' | 'p2p';
   /** Immediate parent — set when the user used the Lark "quote/reply"
    *  UI to reference a specific earlier message. Empty otherwise. */
   parentId?: string;
@@ -1611,6 +1641,7 @@ export type FrozenSessionReplyTarget =
 
 export interface FrozenSessionReplyContext {
   target: FrozenSessionReplyTarget;
+  sourceMessageId?: string;
   quoteTargetId?: string;
   replyTargetSenderOpenId?: string;
   replyTargetSenderIsBot?: boolean;
@@ -1744,10 +1775,17 @@ export interface PendingRepoSetup {
   sender?: { openId: string; type: 'user' | 'bot'; name?: string };
 }
 
+export interface CodexAppEffortResult {
+  status: 'applied' | 'future_only' | 'invalid' | 'unavailable' | 'error';
+  choices?: string[];
+  reason?: 'step_model_switching_disabled' | 'target_unavailable';
+}
+
 /** Messages sent from Daemon to Worker */
 type DaemonToWorkerBase =
+  | { type: 'codex_app_effort'; requestId: string; effort: string }
   | { type: 'worker_ipc_probe' }
-  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; launchShell?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; turnTimeoutMs?: number; dshProfile?: string; dshRuntime?: 'official' | 'tui'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; disableCliBypass?: boolean; noProgressNotify?: import('./services/no-progress-notify-policy.js').NoProgressNotifyPolicy; codexBrowser?: import('./core/codex-browser-config.js').CodexBrowserConfig; codexRpcInput?: boolean; codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode; credentialsSourceDir?: string; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig; existingAppServerEndpoint?: string; startupCommands?: string[]; initialNativeRename?: string; envPolicy?: import('./core/env-policy.js').EnvPolicy; env?: Record<string, string>; replyStyle?: import('./im/lark/reply-card-style.js').ReplyStyleConfig; sandbox?: boolean | 'off' | 'oncall' | 'scratch'; scratchStorage?: 'tmpfs' | 'disk'; scratchTmpfsSizeMb?: number; scratchDenyPaths?: string[]; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; sandboxNetworkPolicy?: import('./core/sandbox-network-policy.js').SandboxNetworkPolicy; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig | RemoteRunnerConfig; remoteBackendState?: RemoteRunnerBackendState; remoteResumeMode?: 'reattach' | 'rebuild'; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; replyDelivery?: 'send' | 'transcript'; promptInjection?: 'default' | 'none'; solo?: boolean; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string }
+  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; launchShell?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; turnTimeoutMs?: number; dshProfile?: string; dshRuntime?: 'official' | 'tui'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; serviceTier?: CodexServiceTier; disableCliBypass?: boolean; noProgressNotify?: import('./services/no-progress-notify-policy.js').NoProgressNotifyPolicy; codexBrowser?: import('./core/codex-browser-config.js').CodexBrowserConfig; codexRpcInput?: boolean; codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode; credentialsSourceDir?: string; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig; existingAppServerEndpoint?: string; startupCommands?: string[]; initialNativeRename?: string; envPolicy?: import('./core/env-policy.js').EnvPolicy; env?: Record<string, string>; replyStyle?: import('./im/lark/reply-card-style.js').ReplyStyleConfig; sandbox?: boolean | 'off' | 'oncall' | 'scratch'; scratchStorage?: 'tmpfs' | 'disk'; scratchTmpfsSizeMb?: number; scratchDenyPaths?: string[]; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; sandboxNetworkPolicy?: import('./core/sandbox-network-policy.js').SandboxNetworkPolicy; readIsolation?: boolean; readDenyExtraPaths?: string[]; autoWorktreeFallbackDir?: string; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig | RemoteRunnerConfig; remoteBackendState?: RemoteRunnerBackendState; remoteResumeMode?: 'reattach' | 'rebuild'; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; replyDelivery?: 'send' | 'transcript'; promptInjection?: 'default' | 'none'; solo?: boolean; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string }
   /** `model` rides along on every turn for the SAME reason the restart IPC carries
    *  it: the crash-loop park recovery respawns the CLI from inside the worker on
    *  the next message, with no restart IPC to refresh the snapshot. Same
@@ -1780,6 +1818,7 @@ type DaemonToWorkerBase =
   * worker to reattach; PTY keeps its historical cold-resume behavior. */
   | { type: 'detach_for_transfer'; requestId: string }
   | { type: 'suspend' }
+  | { type: 'prompt_submitted' }
   /** Kill the CLI and respawn it with --resume. `updateWorkingDir`（可选）
    *  用于角色切换的 cwd-move respawn：respawn 前把 worker 侧 lastInitConfig
    *  收敛到新目录，让 CLI 在新 cwd 冷启动（新 CLAUDE.md/记忆索引开场注入）
@@ -1927,6 +1966,7 @@ export interface ModelFallbackState {
 
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
+  | ({ type: 'codex_app_effort_result'; requestId: string } & CodexAppEffortResult)
   | { type: 'worker_ipc_ready' }
   /** An interruption adopted an executing turn; retain its output visibility. */
   | { type: 'active_turn_envelope_changed'; previousTurnId: string; turnId: string }
@@ -2081,7 +2121,6 @@ export type WorkerToDaemon =
    * the daemon should treat listener-preview runs as visibly replied even
    * though transcript fallback output is suppressed to avoid duplicates. */
   | { type: 'explicit_reply_observed'; turnId: string; messageId?: string; responseKind?: 'progress' | 'final' | 'auxiliary'; terminalCarrier?: 'standard_reply_card' | 'non_patchable' }
-  | { type: 'tui_prompt'; description: string; options: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>; multiSelect?: boolean; turnId?: string; dispatchAttempt?: number }
   | { type: 'tui_prompt_resolved'; selectedText?: string; cardMessageId?: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'tui_prompt_submit_failed'; cardMessageId?: string; stuckNonce?: number; turnId?: string; dispatchAttempt?: number }
   | { type: 'stuck_warning'; elapsedMs: number; snapshot: string; matchedPattern?: string; turnId?: string; dispatchAttempt?: number; cliLifetime?: number }
